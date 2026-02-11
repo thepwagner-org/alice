@@ -1,0 +1,40 @@
+# Test configuration for GCP service account authentication.
+#
+# Uses a real SA key to test proxy-side JWT re-signing with Docker.
+#
+# Usage:
+#   ./scripts/test-docker.sh examples/gcp-test.toml
+#
+# In the container:
+#   gcloud auth activate-service-account --key-file=/tmp/gcp-dummy-sa.json
+#   gcloud storage ls --project=my-project
+
+[proxy]
+listen = "127.0.0.1:3128"
+log_dir = "./logs"
+
+[ca]
+cert_path = "/tmp/alice-ca.pem"
+
+# Allow GCP token exchange (JWT assertion -> access token)
+[[rules]]
+action = "allow"
+host = "oauth2.googleapis.com"
+redact_paths = ["/token"]
+
+# Allow GCP API calls
+[[rules]]
+action = "allow"
+host = "*.googleapis.com"
+
+# GCP service account: Alice re-signs JWTs from the dummy key with the real key
+[[gcp_credentials]]
+name = "my-sa"
+key_file = "/path/to/service-account-key.json"
+dummy_key_path = "/tmp/alice-gcp-dummy.json"
+
+# GCP user credentials: Alice swaps dummy refresh tokens with real ones
+[[gcp_user_credentials]]
+name = "my-user"
+gcloud_config_dir = "/path/to/gcloud/config"
+dummy_config_dir = "/tmp/alice-gcloud"

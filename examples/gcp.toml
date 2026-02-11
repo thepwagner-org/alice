@@ -1,0 +1,55 @@
+# Example configuration for GCP service account authentication via proxy-side JWT re-signing.
+#
+# Alice holds the real SA key, generates a dummy key for Bob, and transparently
+# re-signs JWT assertions before they reach Google's token endpoint.
+#
+# Setup:
+#   1. Place your real SA key at the path specified in key_file
+#   2. Run Alice: cargo run -- -c examples/gcp.toml
+#   3. Alice writes a dummy key to dummy_key_path at startup
+#   4. In Bob's environment:
+#        export GOOGLE_APPLICATION_CREDENTIALS=/tmp/alice-gcp-dummy.json
+#        export https_proxy=http://127.0.0.1:3128
+#        gcloud config set core/custom_ca_certs_file /tmp/alice-ca.pem
+#        gcloud auth activate-service-account --key-file=/tmp/alice-gcp-dummy.json
+#
+# Bob's gcloud/client library signs JWTs with the dummy key. Alice intercepts the
+# token exchange POST to oauth2.googleapis.com/token, verifies the signature
+# matches the dummy key, re-signs with the real key, and forwards to Google.
+# The returned access token is redacted before reaching Bob.
+
+[proxy]
+listen = "127.0.0.1:3128"
+
+[ca]
+cert_path = "/tmp/alice-ca.pem"
+
+[dns]
+cache_ttl_secs = 300
+
+# Allow GCP token exchange (required for JWT assertion flow)
+[[rules]]
+action = "allow"
+host = "oauth2.googleapis.com"
+redact_paths = ["/token"]
+
+# Allow GCP API calls (scope as needed)
+[[rules]]
+action = "allow"
+host = "*.googleapis.com"
+
+# Allow Google auth endpoints (needed for gcloud auth login)
+# [[rules]]
+# action = "allow"
+# host = "accounts.google.com"
+
+# GCP service account credential: proxy-side JWT re-signing
+#
+# key_file:       path to the real GCP service account JSON key file
+# dummy_key_path: where Alice writes the dummy key for Bob
+# scope:          OAuth scope (default: cloud-platform)
+[[gcp_credentials]]
+name = "my-service-account"
+key_file = "/path/to/real-sa-key.json"
+dummy_key_path = "/tmp/alice-gcp-dummy.json"
+# scope = "https://www.googleapis.com/auth/cloud-platform"  # default

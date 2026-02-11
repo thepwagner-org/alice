@@ -1,0 +1,22 @@
+# Example: Allow access to httpbin.org for testing
+#
+# Usage:
+#   cargo run -- -c examples/policies/httpbin.toml
+#
+# Then configure your client to use the proxy at 127.0.0.1:3128
+# and trust the CA certificate at /tmp/alice-ca.pem
+
+[proxy]
+listen = "127.0.0.1:3128"
+
+[ca]
+cert_path = "/tmp/alice-ca.pem"
+
+# First match wins, default deny
+[[rules]]
+action = "allow"
+host = "httpbin.org"
+
+[[rules]]
+action = "allow"
+host = "*.httpbin.org"

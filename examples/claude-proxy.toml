@@ -1,0 +1,63 @@
+# Example: Proxy for Claude Code (or similar LLM coding agents)
+#
+# Allows access to Anthropic APIs and GitHub, with OAuth token redaction,
+# prompt injection scanning, and system prompt customization.
+#
+# Usage:
+#   cargo run -- -c examples/claude-proxy.toml
+
+[proxy]
+listen = "127.0.0.1:3128"
+log_dir = "./logs"
+
+[ca]
+cert_path = "/tmp/alice-ca.pem"
+validity_hours = 6
+host_cert_validity_hours = 2
+
+[observability]
+metrics_listen = "127.0.0.1:9090"
+
+# Anthropic API endpoints with OAuth token redaction
+[[rules]]
+action = "allow"
+host = "*.anthropic.com"
+redact_paths = ["/oauth/token", "/v1/oauth/*", "*/token"]
+
+[[rules]]
+action = "allow"
+host = "api.anthropic.com"
+
+[[rules]]
+action = "allow"
+host = "platform.claude.com"
+redact_paths = ["/v1/oauth/token", "/v1/oauth/*", "*/token"]
+
+# GitHub (for repo access)
+[[rules]]
+action = "allow"
+host = "github.com"
+
+[[rules]]
+action = "allow"
+host = "raw.githubusercontent.com"
+
+# Append a reminder to every system prompt
+[[transforms]]
+type = "system_prompt"
+suffix = "Always include a brief security note when generating code that handles user input."
+
+# Block common prompt injection patterns
+[[transforms]]
+type = "injection_scan"
+action = "block"
+patterns = [
+    "ignore previous instructions",
+    "ignore all previous",
+    "disregard your instructions",
+    "forget your instructions",
+    "you are now",
+    "new instructions:",
+    "system prompt:",
+    "IMPORTANT: from now on",
+]
