@@ -212,6 +212,27 @@ file = "{}"
     )
 }
 
+/// Generate TOML for a basic-auth credential with env source
+fn credential_basic_env(
+    name: &str,
+    host: &str,
+    username: &str,
+    match_value: &str,
+    env_var: &str,
+) -> String {
+    format!(
+        r#"
+[[credentials]]
+name = "{name}"
+host = "{host}"
+scheme = "basic"
+username = "{username}"
+match = "{match_value}"
+env = "{env_var}"
+"#
+    )
+}
+
 // ============================================================================
 // HTTP/1.1 Tests
 // ============================================================================
@@ -975,6 +996,158 @@ async fn test_credential_injection_from_file() {
         "Dummy token should have been replaced, got: {}",
         body
     );
+}
+
+// ============================================================================
+// Basic Auth Credential Injection Tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_credential_injection_basic_auth() {
+    use base64::prelude::*;
+
+    // This test verifies that basic-auth credentials are base64-decoded, matched, and re-encoded
+    let upstream_port = find_available_port().await;
+    let proxy_port = find_available_port().await;
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+
+    // Set the real secret in environment
+    std::env::set_var("TEST_BASIC_AUTH_SECRET", "real-registry-token");
+
+    // Start upstream HTTPS server
+    let (upstream_cert, _upstream_handle) = spawn_https_server(upstream_port).await;
+
+    // Start proxy with basic-auth credential injection
+    let _proxy_handle = spawn_proxy(
+        ProxyConfig {
+            listen_port: proxy_port,
+            rules: vec![RuleSpec::host("allow", "localhost")],
+            auth: None,
+            upstream_ca_pem: Some(upstream_cert.clone()),
+            credentials_toml: vec![credential_basic_env(
+                "basic-cred",
+                "localhost",
+                "token",
+                "DUMMY_REGISTRY_TOKEN",
+                "TEST_BASIC_AUTH_SECRET",
+            )],
+            dns_hosts: vec![],
+            ..Default::default()
+        },
+        &temp_dir,
+    )
+    .await;
+
+    // Build client
+    let client = client_with_proxy(proxy_port, &temp_dir.path().join("ca.pem"), None);
+
+    // Client sends: Authorization: Basic base64("token:DUMMY_REGISTRY_TOKEN")
+    // This is what Bundler/pip would send with a dummy password configured
+    let dummy_b64 = BASE64_STANDARD.encode(b"token:DUMMY_REGISTRY_TOKEN");
+    let dummy_header = format!("Basic {}", dummy_b64);
+
+    let url = format!("https://localhost:{}/headers", upstream_port);
+    let result = timeout(
+        Duration::from_secs(5),
+        client
+            .get(&url)
+            .header("Authorization", &dummy_header)
+            .send(),
+    )
+    .await;
+
+    let response = result.expect("timeout").expect("request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.text().await.expect("body");
+
+    // The upstream should see: Basic base64("token:real-registry-token")
+    let expected_b64 = BASE64_STANDARD.encode(b"token:real-registry-token");
+    assert!(
+        body.contains(&expected_b64),
+        "Expected base64-encoded real credential, got: {}",
+        body
+    );
+    // The dummy token should NOT appear (neither in base64 nor plaintext)
+    assert!(
+        !body.contains(&dummy_b64),
+        "Dummy base64 should have been replaced, got: {}",
+        body
+    );
+    assert!(
+        !body.contains("DUMMY_REGISTRY_TOKEN"),
+        "Dummy token should not appear in plaintext, got: {}",
+        body
+    );
+
+    std::env::remove_var("TEST_BASIC_AUTH_SECRET");
+}
+
+#[tokio::test]
+async fn test_credential_injection_basic_auth_no_match() {
+    use base64::prelude::*;
+
+    // This test verifies that basic-auth credentials are NOT replaced when the password doesn't match
+    let upstream_port = find_available_port().await;
+    let proxy_port = find_available_port().await;
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+
+    std::env::set_var("TEST_BASIC_AUTH_NO_MATCH", "should-not-see-this");
+
+    let (upstream_cert, _upstream_handle) = spawn_https_server(upstream_port).await;
+
+    let _proxy_handle = spawn_proxy(
+        ProxyConfig {
+            listen_port: proxy_port,
+            rules: vec![RuleSpec::host("allow", "localhost")],
+            auth: None,
+            upstream_ca_pem: Some(upstream_cert.clone()),
+            credentials_toml: vec![credential_basic_env(
+                "basic-cred",
+                "localhost",
+                "token",
+                "DUMMY_REGISTRY_TOKEN",
+                "TEST_BASIC_AUTH_NO_MATCH",
+            )],
+            dns_hosts: vec![],
+            ..Default::default()
+        },
+        &temp_dir,
+    )
+    .await;
+
+    let client = client_with_proxy(proxy_port, &temp_dir.path().join("ca.pem"), None);
+
+    // Client sends a DIFFERENT password — should NOT be replaced
+    let other_b64 = BASE64_STANDARD.encode(b"token:SOME_OTHER_TOKEN");
+    let other_header = format!("Basic {}", other_b64);
+
+    let url = format!("https://localhost:{}/headers", upstream_port);
+    let result = timeout(
+        Duration::from_secs(5),
+        client
+            .get(&url)
+            .header("Authorization", &other_header)
+            .send(),
+    )
+    .await;
+
+    let response = result.expect("timeout").expect("request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.text().await.expect("body");
+
+    // The original header should pass through unchanged
+    assert!(
+        body.contains(&other_b64),
+        "Original token should pass through, got: {}",
+        body
+    );
+    assert!(
+        !body.contains("should-not-see-this"),
+        "Secret should NOT be injected when password doesn't match, got: {}",
+        body
+    );
+
+    std::env::remove_var("TEST_BASIC_AUTH_NO_MATCH");
 }
 
 // ============================================================================

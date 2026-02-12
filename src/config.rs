@@ -142,6 +142,20 @@ pub enum Action {
     Deny,
 }
 
+/// Authentication scheme for credential injection.
+#[derive(Debug, Clone, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum CredentialScheme {
+    /// Custom header matching (default, backward-compatible behavior).
+    /// Requires `header`, `match`, and optionally `format`.
+    #[default]
+    Custom,
+    /// HTTP Basic authentication.
+    /// Alice decodes the base64 `Authorization: Basic <b64>` header,
+    /// matches `username:match`, and re-encodes with the real secret.
+    Basic,
+}
+
 /// Credential from main config (env or file source).
 /// NOTE: `value` field is NOT allowed here - only in SOPS-encrypted files.
 #[derive(Debug, Clone, Deserialize)]
@@ -149,14 +163,23 @@ pub struct Credential {
     pub name: String,
     /// Host glob pattern (e.g., "api.github.com", "*.example.com")
     pub host: String,
+    /// Authentication scheme (default: "custom" for backward compatibility)
+    #[serde(default)]
+    pub scheme: CredentialScheme,
     /// HTTP header name to inject (e.g., "Authorization")
-    pub header: String,
+    /// Required for `scheme = "custom"`. Must not be set for `scheme = "basic"`.
+    pub header: Option<String>,
     /// Dummy token value to match (replacement only happens if header equals this)
+    /// For `scheme = "custom"`: full header value (e.g., "Bearer DUMMY_TOKEN")
+    /// For `scheme = "basic"`: the dummy password portion only
     #[serde(rename = "match")]
     pub match_value: String,
     /// Format string for the real value (e.g., "Bearer {value}")
-    #[serde(default = "default_format")]
-    pub format: String,
+    /// Only used with `scheme = "custom"` (defaults to "{value}" if omitted).
+    /// Must not be set for `scheme = "basic"`.
+    pub format: Option<String>,
+    /// Username for HTTP Basic auth. Required when `scheme = "basic"`.
+    pub username: Option<String>,
     /// Environment variable containing the real secret
     pub env: Option<String>,
     /// File path containing the real secret
@@ -196,10 +219,6 @@ pub struct GcpUserCredential {
 
 fn default_gcp_scope() -> String {
     "https://www.googleapis.com/auth/cloud-platform".to_string()
-}
-
-fn default_format() -> String {
-    "{value}".to_string()
 }
 
 pub fn load(path: &Path) -> Result<Config> {
