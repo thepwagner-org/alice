@@ -56,10 +56,10 @@ thiserror = "1"
 anyhow = "1"
 
 # Metrics
-prometheus = "0.13"
+prometheus = "0.14"
 
 # JWT / GCP auth
-jsonwebtoken = "9"
+jsonwebtoken = { version = "10", features = ["rust_crypto", "use_pem"] }
 rsa = { version = "0.9", features = ["pem"] }
 rand = "0.8"
 url = "2"

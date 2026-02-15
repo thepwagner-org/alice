@@ -1051,7 +1051,7 @@ fn inject_credentials_h1(request_buf: &[u8], host: &str, state: &ProxyState) -> 
                     state
                         .metrics
                         .credential_injections_total
-                        .with_label_values(&[&replacement.credential_name, host])
+                        .with_label_values(&[replacement.credential_name.as_str(), host])
                         .inc();
                     result.extend_from_slice(name.as_bytes());
                     result.extend_from_slice(b": ");

@@ -812,7 +812,7 @@ fn inject_credentials_h2(headers: &mut HeaderMap, host: &str, state: &ProxyState
         state
             .metrics
             .credential_injections_total
-            .with_label_values(&[&replacement.credential_name, host])
+            .with_label_values(&[replacement.credential_name.as_str(), host])
             .inc();
         headers.insert(name, replacement.value);
     }
