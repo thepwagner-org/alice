@@ -17,8 +17,8 @@ use tokio::time::timeout;
 // ============================================================================
 
 /// Spawn a mock HTTPS server that only supports HTTP/1.1 (no ALPN h2)
-async fn spawn_https_server_h1_only(port: u16) -> (String, tokio::task::JoinHandle<()>) {
-    spawn_https_server_with_app(port, default_router(), false).await
+async fn spawn_https_server_h1_only() -> (u16, String, tokio::task::JoinHandle<()>) {
+    spawn_https_server_with_app(default_router(), false).await
 }
 
 fn default_router() -> axum::Router {
@@ -239,12 +239,11 @@ env = "{env_var}"
 
 #[tokio::test]
 async fn test_basic_proxy_flow() {
-    let upstream_port = find_available_port().await;
     let proxy_port = find_available_port().await;
     let temp_dir = tempfile::tempdir().expect("temp dir");
 
     // Start upstream HTTPS server
-    let (upstream_cert, _upstream_handle) = spawn_https_server(upstream_port).await;
+    let (upstream_port, upstream_cert, _upstream_handle) = spawn_https_server().await;
 
     // Start proxy allowing localhost
     let _proxy_handle = spawn_proxy(
@@ -273,12 +272,11 @@ async fn test_basic_proxy_flow() {
 
 #[tokio::test]
 async fn test_host_denied() {
-    let upstream_port = find_available_port().await;
     let proxy_port = find_available_port().await;
     let temp_dir = tempfile::tempdir().expect("temp dir");
 
     // Start upstream HTTPS server
-    let (upstream_cert, _upstream_handle) = spawn_https_server(upstream_port).await;
+    let (upstream_port, upstream_cert, _upstream_handle) = spawn_https_server().await;
 
     // Start proxy denying localhost
     let _proxy_handle = spawn_proxy(
@@ -305,12 +303,11 @@ async fn test_host_denied() {
 
 #[tokio::test]
 async fn test_path_allowed() {
-    let upstream_port = find_available_port().await;
     let proxy_port = find_available_port().await;
     let temp_dir = tempfile::tempdir().expect("temp dir");
 
     // Start upstream HTTPS server
-    let (upstream_cert, _upstream_handle) = spawn_https_server(upstream_port).await;
+    let (upstream_port, upstream_cert, _upstream_handle) = spawn_https_server().await;
 
     // Start proxy allowing only /get path
     let _proxy_handle = spawn_proxy(
@@ -337,12 +334,11 @@ async fn test_path_allowed() {
 
 #[tokio::test]
 async fn test_path_denied() {
-    let upstream_port = find_available_port().await;
     let proxy_port = find_available_port().await;
     let temp_dir = tempfile::tempdir().expect("temp dir");
 
     // Start upstream HTTPS server
-    let (upstream_cert, _upstream_handle) = spawn_https_server(upstream_port).await;
+    let (upstream_port, upstream_cert, _upstream_handle) = spawn_https_server().await;
 
     // Start proxy allowing only /get path
     let _proxy_handle = spawn_proxy(
@@ -369,12 +365,11 @@ async fn test_path_denied() {
 
 #[tokio::test]
 async fn test_proxy_auth_required() {
-    let upstream_port = find_available_port().await;
     let proxy_port = find_available_port().await;
     let temp_dir = tempfile::tempdir().expect("temp dir");
 
     // Start upstream HTTPS server
-    let (upstream_cert, _upstream_handle) = spawn_https_server(upstream_port).await;
+    let (upstream_port, upstream_cert, _upstream_handle) = spawn_https_server().await;
 
     // Start proxy with auth required
     let _proxy_handle = spawn_proxy(
@@ -401,12 +396,11 @@ async fn test_proxy_auth_required() {
 
 #[tokio::test]
 async fn test_proxy_auth_success() {
-    let upstream_port = find_available_port().await;
     let proxy_port = find_available_port().await;
     let temp_dir = tempfile::tempdir().expect("temp dir");
 
     // Start upstream HTTPS server
-    let (upstream_cert, _upstream_handle) = spawn_https_server(upstream_port).await;
+    let (upstream_port, upstream_cert, _upstream_handle) = spawn_https_server().await;
 
     // Start proxy with auth required
     let _proxy_handle = spawn_proxy(
@@ -438,12 +432,11 @@ async fn test_proxy_auth_success() {
 
 #[tokio::test]
 async fn test_proxy_auth_wrong_password() {
-    let upstream_port = find_available_port().await;
     let proxy_port = find_available_port().await;
     let temp_dir = tempfile::tempdir().expect("temp dir");
 
     // Start upstream HTTPS server
-    let (upstream_cert, _upstream_handle) = spawn_https_server(upstream_port).await;
+    let (upstream_port, upstream_cert, _upstream_handle) = spawn_https_server().await;
 
     // Start proxy with auth required
     let _proxy_handle = spawn_proxy(
@@ -525,12 +518,11 @@ async fn test_non_connect_rejected() {
 async fn test_http2_path_policy() {
     // This test verifies HTTP/2 path-based policy enforcement.
     // The proxy inspects individual HTTP/2 streams for path-based policy.
-    let upstream_port = find_available_port().await;
     let proxy_port = find_available_port().await;
     let temp_dir = tempfile::tempdir().expect("temp dir");
 
     // Start upstream HTTPS server
-    let (upstream_cert, _upstream_handle) = spawn_https_server(upstream_port).await;
+    let (upstream_port, upstream_cert, _upstream_handle) = spawn_https_server().await;
 
     // Start proxy with path-based rule (this is what needs HTTP/2 inspection)
     let _proxy_handle = spawn_proxy(
@@ -565,12 +557,11 @@ async fn test_http2_path_policy() {
 async fn test_http2_to_http1_translation() {
     // This test verifies that the proxy can translate HTTP/2 client requests
     // to HTTP/1.1 when the upstream server doesn't support HTTP/2.
-    let upstream_port = find_available_port().await;
     let proxy_port = find_available_port().await;
     let temp_dir = tempfile::tempdir().expect("temp dir");
 
     // Start upstream HTTPS server that ONLY supports HTTP/1.1
-    let (upstream_cert, _upstream_handle) = spawn_https_server_h1_only(upstream_port).await;
+    let (upstream_port, upstream_cert, _upstream_handle) = spawn_https_server_h1_only().await;
 
     // Start proxy with path-based rule
     let _proxy_handle = spawn_proxy(
@@ -606,7 +597,6 @@ async fn test_http2_to_http1_translation() {
 #[tokio::test]
 async fn test_credential_injection() {
     // This test verifies that the proxy replaces dummy tokens with real secrets
-    let upstream_port = find_available_port().await;
     let proxy_port = find_available_port().await;
     let temp_dir = tempfile::tempdir().expect("temp dir");
 
@@ -614,7 +604,7 @@ async fn test_credential_injection() {
     std::env::set_var("TEST_REAL_SECRET", "actual-secret-value");
 
     // Start upstream HTTPS server
-    let (upstream_cert, _upstream_handle) = spawn_https_server(upstream_port).await;
+    let (upstream_port, upstream_cert, _upstream_handle) = spawn_https_server().await;
 
     // Start proxy with credential injection configured
     let _proxy_handle = spawn_proxy(
@@ -675,7 +665,6 @@ async fn test_credential_injection() {
 #[tokio::test]
 async fn test_credential_no_replacement_when_no_match() {
     // This test verifies that credentials are NOT replaced when the header doesn't match
-    let upstream_port = find_available_port().await;
     let proxy_port = find_available_port().await;
     let temp_dir = tempfile::tempdir().expect("temp dir");
 
@@ -683,7 +672,7 @@ async fn test_credential_no_replacement_when_no_match() {
     std::env::set_var("TEST_REAL_SECRET_2", "should-not-see-this");
 
     // Start upstream HTTPS server
-    let (upstream_cert, _upstream_handle) = spawn_https_server(upstream_port).await;
+    let (upstream_port, upstream_cert, _upstream_handle) = spawn_https_server().await;
 
     // Start proxy with credential injection configured
     let _proxy_handle = spawn_proxy(
@@ -743,7 +732,6 @@ async fn test_credential_no_replacement_when_no_match() {
 #[tokio::test]
 async fn test_credential_no_header() {
     // This test verifies that requests without the credential header pass through normally
-    let upstream_port = find_available_port().await;
     let proxy_port = find_available_port().await;
     let temp_dir = tempfile::tempdir().expect("temp dir");
 
@@ -751,7 +739,7 @@ async fn test_credential_no_header() {
     std::env::set_var("TEST_REAL_SECRET_3", "secret-value");
 
     // Start upstream HTTPS server
-    let (upstream_cert, _upstream_handle) = spawn_https_server(upstream_port).await;
+    let (upstream_port, upstream_cert, _upstream_handle) = spawn_https_server().await;
 
     // Start proxy with credential injection configured
     let _proxy_handle = spawn_proxy(
@@ -799,7 +787,6 @@ async fn test_credential_no_header() {
 #[tokio::test]
 async fn test_credential_host_mismatch() {
     // This test verifies that credentials scoped to one host don't apply to others
-    let upstream_port = find_available_port().await;
     let proxy_port = find_available_port().await;
     let temp_dir = tempfile::tempdir().expect("temp dir");
 
@@ -807,7 +794,7 @@ async fn test_credential_host_mismatch() {
     std::env::set_var("TEST_REAL_SECRET_4", "host-scoped-secret");
 
     // Start upstream HTTPS server
-    let (upstream_cert, _upstream_handle) = spawn_https_server(upstream_port).await;
+    let (upstream_port, upstream_cert, _upstream_handle) = spawn_https_server().await;
 
     // Start proxy with credential injection configured for a DIFFERENT host
     let _proxy_handle = spawn_proxy(
@@ -868,7 +855,6 @@ async fn test_credential_host_mismatch() {
 async fn test_credential_partial_token_no_match() {
     // This test verifies that partial/similar tokens don't trigger replacement
     // (we require exact match, not substring/prefix match)
-    let upstream_port = find_available_port().await;
     let proxy_port = find_available_port().await;
     let temp_dir = tempfile::tempdir().expect("temp dir");
 
@@ -876,7 +862,7 @@ async fn test_credential_partial_token_no_match() {
     std::env::set_var("TEST_REAL_SECRET_5", "exact-match-secret");
 
     // Start upstream HTTPS server
-    let (upstream_cert, _upstream_handle) = spawn_https_server(upstream_port).await;
+    let (upstream_port, upstream_cert, _upstream_handle) = spawn_https_server().await;
 
     // Start proxy with credential injection configured
     let _proxy_handle = spawn_proxy(
@@ -936,7 +922,6 @@ async fn test_credential_partial_token_no_match() {
 #[tokio::test]
 async fn test_credential_injection_from_file() {
     // This test verifies that credentials can be loaded from files (not just env vars)
-    let upstream_port = find_available_port().await;
     let proxy_port = find_available_port().await;
     let temp_dir = tempfile::tempdir().expect("temp dir");
 
@@ -945,7 +930,7 @@ async fn test_credential_injection_from_file() {
     std::fs::write(&secret_file, "  file-based-secret-value  \n").expect("write secret file");
 
     // Start upstream HTTPS server
-    let (upstream_cert, _upstream_handle) = spawn_https_server(upstream_port).await;
+    let (upstream_port, upstream_cert, _upstream_handle) = spawn_https_server().await;
 
     // Start proxy with file-based credential injection
     let _proxy_handle = spawn_proxy(
@@ -1007,7 +992,6 @@ async fn test_credential_injection_basic_auth() {
     use base64::prelude::*;
 
     // This test verifies that basic-auth credentials are base64-decoded, matched, and re-encoded
-    let upstream_port = find_available_port().await;
     let proxy_port = find_available_port().await;
     let temp_dir = tempfile::tempdir().expect("temp dir");
 
@@ -1015,7 +999,7 @@ async fn test_credential_injection_basic_auth() {
     std::env::set_var("TEST_BASIC_AUTH_SECRET", "real-registry-token");
 
     // Start upstream HTTPS server
-    let (upstream_cert, _upstream_handle) = spawn_https_server(upstream_port).await;
+    let (upstream_port, upstream_cert, _upstream_handle) = spawn_https_server().await;
 
     // Start proxy with basic-auth credential injection
     let _proxy_handle = spawn_proxy(
@@ -1087,13 +1071,12 @@ async fn test_credential_injection_basic_auth_no_match() {
     use base64::prelude::*;
 
     // This test verifies that basic-auth credentials are NOT replaced when the password doesn't match
-    let upstream_port = find_available_port().await;
     let proxy_port = find_available_port().await;
     let temp_dir = tempfile::tempdir().expect("temp dir");
 
     std::env::set_var("TEST_BASIC_AUTH_NO_MATCH", "should-not-see-this");
 
-    let (upstream_cert, _upstream_handle) = spawn_https_server(upstream_port).await;
+    let (upstream_port, upstream_cert, _upstream_handle) = spawn_https_server().await;
 
     let _proxy_handle = spawn_proxy(
         ProxyConfig {
@@ -1166,12 +1149,11 @@ async fn test_h1_persistent_connection_policy_bypass() {
     // 3. On same connection, attacker makes request to /post (should be denied)
     // 4. BUG: The second request is NOT checked and goes through!
 
-    let upstream_port = find_available_port().await;
     let proxy_port = find_available_port().await;
     let temp_dir = tempfile::tempdir().expect("temp dir");
 
     // Start upstream HTTPS server (HTTP/1.1 only to ensure no H2 multiplexing)
-    let (upstream_cert, _upstream_handle) = spawn_https_server_h1_only(upstream_port).await;
+    let (upstream_port, upstream_cert, _upstream_handle) = spawn_https_server_h1_only().await;
 
     // Start proxy allowing ONLY /get path
     let _proxy_handle = spawn_proxy(
@@ -1218,12 +1200,11 @@ async fn test_h1_multiple_requests_all_checked() {
     // Verify that ALL requests on a persistent HTTP/1.1 connection are policy-checked,
     // not just the first one. This tests the fix for the policy bypass vulnerability.
 
-    let upstream_port = find_available_port().await;
     let proxy_port = find_available_port().await;
     let temp_dir = tempfile::tempdir().expect("temp dir");
 
     // Start upstream HTTPS server (HTTP/1.1 only)
-    let (upstream_cert, _upstream_handle) = spawn_https_server_h1_only(upstream_port).await;
+    let (upstream_port, upstream_cert, _upstream_handle) = spawn_https_server_h1_only().await;
 
     // Start proxy allowing both /get and /headers, but NOT /post
     let _proxy_handle = spawn_proxy(
@@ -1384,12 +1365,11 @@ async fn test_cidr_denies_rfc1918() {
 /// Scenario: Allow specific host, but deny if it resolves to private IP.
 #[tokio::test]
 async fn test_cidr_and_host_rules_combined() {
-    let upstream_port = find_available_port().await;
     let proxy_port = find_available_port().await;
     let temp_dir = tempfile::tempdir().expect("temp dir");
 
     // Start upstream server
-    let (upstream_cert, _upstream_handle) = spawn_https_server(upstream_port).await;
+    let (upstream_port, upstream_cert, _upstream_handle) = spawn_https_server().await;
 
     // Start proxy: allow specific host, but deny private IPs
     // Order matters: CIDR deny should be checked AFTER DNS resolution
@@ -1440,11 +1420,10 @@ async fn test_cidr_and_host_rules_combined() {
 /// Test that CIDR allow rules can permit specific internal services.
 #[tokio::test]
 async fn test_cidr_allows_specific_internal() {
-    let upstream_port = find_available_port().await;
     let proxy_port = find_available_port().await;
     let temp_dir = tempfile::tempdir().expect("temp dir");
 
-    let (upstream_cert, _upstream_handle) = spawn_https_server(upstream_port).await;
+    let (upstream_port, upstream_cert, _upstream_handle) = spawn_https_server().await;
 
     // Proxy config: deny all private IPs EXCEPT specific allowed ones
     // Map "allowed-internal.test" to 127.0.0.1 so we can actually connect
@@ -1487,12 +1466,11 @@ async fn test_cidr_allows_specific_internal() {
 async fn test_oauth_token_redaction() {
     // This test verifies that OAuth tokens in responses are redacted and replaced
     // with dummy tokens that the proxy can later swap back to real tokens.
-    let upstream_port = find_available_port().await;
     let proxy_port = find_available_port().await;
     let temp_dir = tempfile::tempdir().expect("temp dir");
 
     // Start upstream HTTPS server (has /oauth/token endpoint)
-    let (upstream_cert, _upstream_handle) = spawn_https_server(upstream_port).await;
+    let (upstream_port, upstream_cert, _upstream_handle) = spawn_https_server().await;
 
     // Start proxy with token redaction enabled for /oauth/token path
     let _proxy_handle = spawn_proxy(
@@ -1570,12 +1548,11 @@ async fn test_oauth_token_redaction() {
 #[tokio::test]
 async fn test_oauth_token_no_redaction_when_not_configured() {
     // This test verifies that OAuth tokens are NOT redacted when redact_paths is empty
-    let upstream_port = find_available_port().await;
     let proxy_port = find_available_port().await;
     let temp_dir = tempfile::tempdir().expect("temp dir");
 
     // Start upstream HTTPS server
-    let (upstream_cert, _upstream_handle) = spawn_https_server(upstream_port).await;
+    let (upstream_port, upstream_cert, _upstream_handle) = spawn_https_server().await;
 
     // Start proxy WITHOUT token redaction
     let _proxy_handle = spawn_proxy(
@@ -1616,12 +1593,11 @@ async fn test_oauth_token_no_redaction_when_not_configured() {
 async fn test_oauth_token_replacement_on_request() {
     // This test verifies that dummy tokens in outbound requests are replaced
     // with real tokens that were previously redacted.
-    let upstream_port = find_available_port().await;
     let proxy_port = find_available_port().await;
     let temp_dir = tempfile::tempdir().expect("temp dir");
 
     // Start upstream HTTPS server
-    let (upstream_cert, _upstream_handle) = spawn_https_server(upstream_port).await;
+    let (upstream_port, upstream_cert, _upstream_handle) = spawn_https_server().await;
 
     // Start proxy with token redaction enabled
     let _proxy_handle = spawn_proxy(
@@ -1698,12 +1674,11 @@ async fn test_sse_streaming_h1() {
     // Test that SSE events are delivered incrementally through the proxy,
     // not buffered until the stream ends. This is critical for Claude Code
     // which uses SSE for streaming API responses.
-    let upstream_port = find_available_port().await;
     let proxy_port = find_available_port().await;
     let temp_dir = tempfile::tempdir().expect("temp dir");
 
     // Start upstream HTTPS server (H1 only to test H1 inspection path)
-    let (upstream_cert, _upstream_handle) = spawn_https_server_h1_only(upstream_port).await;
+    let (upstream_port, upstream_cert, _upstream_handle) = spawn_https_server_h1_only().await;
 
     // Start proxy allowing localhost
     let _proxy_handle = spawn_proxy(
@@ -1778,12 +1753,11 @@ async fn test_sse_streaming_h1_with_inspection() {
     // This is triggered by having a path-based rule, which forces the proxy
     // to parse every HTTP request on the connection (not just bidirectional copy).
     // This is the code path that Claude Code hits because it has redact_paths.
-    let upstream_port = find_available_port().await;
     let proxy_port = find_available_port().await;
     let temp_dir = tempfile::tempdir().expect("temp dir");
 
     // Start upstream HTTPS server (H1 only)
-    let (upstream_cert, _upstream_handle) = spawn_https_server_h1_only(upstream_port).await;
+    let (upstream_port, upstream_cert, _upstream_handle) = spawn_https_server_h1_only().await;
 
     // Use a path rule to force the inspection path
     let _proxy_handle = spawn_proxy(
@@ -1851,12 +1825,11 @@ async fn test_sse_streaming_h1_with_inspection() {
 #[tokio::test]
 async fn test_sse_streaming_h2() {
     // Test SSE streaming through the H2-to-H2 proxy path
-    let upstream_port = find_available_port().await;
     let proxy_port = find_available_port().await;
     let temp_dir = tempfile::tempdir().expect("temp dir");
 
     // Start upstream HTTPS server (with H2 support)
-    let (upstream_cert, _upstream_handle) = spawn_https_server(upstream_port).await;
+    let (upstream_port, upstream_cert, _upstream_handle) = spawn_https_server().await;
 
     // Start proxy allowing localhost
     let _proxy_handle = spawn_proxy(
@@ -1933,14 +1906,13 @@ async fn test_sse_streaming_h2() {
 async fn test_llm_metrics_h1_single_tool() {
     // Test that LLM metrics are extracted from a streaming /v1/messages response
     // through the HTTP/1.1 inspection path (proxy_with_inspection).
-    let upstream_port = find_available_port().await;
     let proxy_port = find_available_port().await;
     let metrics_port = find_available_port().await;
     let temp_dir = tempfile::tempdir().expect("temp dir");
 
     // Start upstream mock with /v1/messages serving single-tool SSE fixture
-    let (upstream_cert, _upstream_handle) =
-        spawn_https_server_with_app(upstream_port, llm_router(LLM_SSE_SINGLE_TOOL), false).await;
+    let (upstream_port, upstream_cert, _upstream_handle) =
+        spawn_https_server_with_app(llm_router(LLM_SSE_SINGLE_TOOL), false).await;
 
     // Start proxy with path-based rule (forces inspection path) and metrics endpoint
     let _proxy = spawn_proxy(
@@ -2014,13 +1986,12 @@ async fn test_llm_metrics_h1_single_tool() {
 #[tokio::test]
 async fn test_llm_metrics_h1_text_only() {
     // Test text-only response (no tool calls) — verify token counts and empty tool_calls
-    let upstream_port = find_available_port().await;
     let proxy_port = find_available_port().await;
     let metrics_port = find_available_port().await;
     let temp_dir = tempfile::tempdir().expect("temp dir");
 
-    let (upstream_cert, _upstream_handle) =
-        spawn_https_server_with_app(upstream_port, llm_router(LLM_SSE_TEXT_ONLY), false).await;
+    let (upstream_port, upstream_cert, _upstream_handle) =
+        spawn_https_server_with_app(llm_router(LLM_SSE_TEXT_ONLY), false).await;
 
     let _proxy = spawn_proxy(
         ProxyConfig {
@@ -2077,14 +2048,13 @@ async fn test_llm_metrics_h1_text_only() {
 #[tokio::test]
 async fn test_llm_metrics_h2() {
     // Test LLM metrics through the HTTP/2 proxy path (handle_stream in h2.rs).
-    let upstream_port = find_available_port().await;
     let proxy_port = find_available_port().await;
     let metrics_port = find_available_port().await;
     let temp_dir = tempfile::tempdir().expect("temp dir");
 
     // Start upstream mock with H2 enabled
-    let (upstream_cert, _upstream_handle) =
-        spawn_https_server_with_app(upstream_port, llm_router(LLM_SSE_SINGLE_TOOL), true).await;
+    let (upstream_port, upstream_cert, _upstream_handle) =
+        spawn_https_server_with_app(llm_router(LLM_SSE_SINGLE_TOOL), true).await;
 
     let _proxy = spawn_proxy(
         ProxyConfig {
@@ -2154,12 +2124,11 @@ async fn test_llm_metrics_h2() {
 async fn test_system_prompt_injection_h1() {
     // Test that the proxy appends a suffix to the system prompt in /v1/messages requests.
     // Uses an echo endpoint that returns the request body so we can inspect the modification.
-    let upstream_port = find_available_port().await;
     let proxy_port = find_available_port().await;
     let temp_dir = tempfile::tempdir().expect("temp dir");
 
-    let (upstream_cert, _upstream_handle) =
-        spawn_https_server_with_app(upstream_port, echo_router(), false).await;
+    let (upstream_port, upstream_cert, _upstream_handle) =
+        spawn_https_server_with_app(echo_router(), false).await;
 
     let _proxy = spawn_proxy(
         ProxyConfig {
@@ -2214,12 +2183,11 @@ async fn test_system_prompt_injection_h1() {
 #[tokio::test]
 async fn test_system_prompt_injection_absent_system() {
     // When the request has no "system" field, the proxy should add one.
-    let upstream_port = find_available_port().await;
     let proxy_port = find_available_port().await;
     let temp_dir = tempfile::tempdir().expect("temp dir");
 
-    let (upstream_cert, _upstream_handle) =
-        spawn_https_server_with_app(upstream_port, echo_router(), false).await;
+    let (upstream_port, upstream_cert, _upstream_handle) =
+        spawn_https_server_with_app(echo_router(), false).await;
 
     let _proxy = spawn_proxy(
         ProxyConfig {
@@ -2266,11 +2234,10 @@ async fn test_system_prompt_injection_absent_system() {
 #[tokio::test]
 async fn test_system_prompt_injection_non_messages_unmodified() {
     // Non-/v1/messages paths should NOT have their body modified.
-    let upstream_port = find_available_port().await;
     let proxy_port = find_available_port().await;
     let temp_dir = tempfile::tempdir().expect("temp dir");
 
-    let (upstream_cert, _upstream_handle) = spawn_https_server(upstream_port).await;
+    let (upstream_port, upstream_cert, _upstream_handle) = spawn_https_server().await;
 
     let _proxy = spawn_proxy(
         ProxyConfig {
@@ -2341,12 +2308,11 @@ fn extract_counter(metrics: &str, name: &str, labels: &[(&str, &str)]) -> Option
 async fn test_prometheus_request_metrics() {
     // Verifies that alice_requests_total, alice_request_bytes_total, and
     // alice_response_bytes_total are incremented for allowed and denied requests.
-    let upstream_port = find_available_port().await;
     let proxy_port = find_available_port().await;
     let metrics_port = find_available_port().await;
     let temp_dir = tempfile::tempdir().expect("temp dir");
 
-    let (upstream_cert, _upstream_handle) = spawn_https_server(upstream_port).await;
+    let (upstream_port, upstream_cert, _upstream_handle) = spawn_https_server().await;
 
     // Only allow /get, deny everything else by default
     let _proxy = spawn_proxy(
@@ -2453,14 +2419,13 @@ async fn test_prometheus_request_metrics() {
 async fn test_prometheus_credential_metrics() {
     // Verifies that alice_credential_injections_total is incremented when
     // credentials are injected.
-    let upstream_port = find_available_port().await;
     let proxy_port = find_available_port().await;
     let metrics_port = find_available_port().await;
     let temp_dir = tempfile::tempdir().expect("temp dir");
 
     std::env::set_var("TEST_PROM_CRED_SECRET", "real-secret");
 
-    let (upstream_cert, _upstream_handle) = spawn_https_server(upstream_port).await;
+    let (upstream_port, upstream_cert, _upstream_handle) = spawn_https_server().await;
 
     let _proxy = spawn_proxy(
         ProxyConfig {

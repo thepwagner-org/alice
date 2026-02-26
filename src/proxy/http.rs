@@ -249,7 +249,7 @@ where
     UW: AsyncWriteExt + Unpin,
 {
     let client_to_upstream = async {
-        let mut buf = vec![0u8; 8192];
+        let mut buf = vec![0u8; 65536];
         loop {
             let n = client_read.read(&mut buf).await?;
             if n == 0 {
@@ -262,7 +262,7 @@ where
     };
 
     let upstream_to_client = async {
-        let mut buf = vec![0u8; 8192];
+        let mut buf = vec![0u8; 65536];
         loop {
             let n = upstream_read.read(&mut buf).await?;
             if n == 0 {
@@ -788,7 +788,7 @@ async fn read_body_chunked<R: AsyncBufReadExt + Unpin>(reader: &mut R) -> Result
     Ok(body)
 }
 
-/// Stream a fixed-length body from reader to writer, flushing after each chunk.
+/// Stream a fixed-length body from reader to writer.
 /// Returns the captured body for logging.
 async fn stream_body_fixed<R, W>(reader: &mut R, writer: &mut W, length: u64) -> Result<Vec<u8>>
 where
@@ -797,7 +797,7 @@ where
 {
     let mut body = Vec::with_capacity(length as usize);
     let mut remaining = length;
-    let mut buf = [0u8; 8192];
+    let mut buf = vec![0u8; 65536];
 
     while remaining > 0 {
         let to_read = std::cmp::min(remaining as usize, buf.len());
@@ -809,7 +809,6 @@ where
         body.extend_from_slice(&buf[..n]);
         // Forward to client immediately
         writer.write_all(&buf[..n]).await?;
-        writer.flush().await?;
         remaining -= n as u64;
     }
 
@@ -860,7 +859,7 @@ where
 
         // Read and forward chunk data
         let mut remaining = chunk_size;
-        let mut buf = [0u8; 8192];
+        let mut buf = vec![0u8; 65536];
         while remaining > 0 {
             let to_read = std::cmp::min(remaining, buf.len());
             let n = reader.read(&mut buf[..to_read]).await?;

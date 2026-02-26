@@ -41,7 +41,7 @@ Optional proxy authentication (HTTP Basic over the CONNECT request) restricts wh
 
 **1. Malicious upstream servers**
 
-Alice does not inspect response content (Phase 1). A malicious allowed host could return harmful data. Future phases may add response inspection.
+Alice inspects and modifies some response content (OAuth token redaction, LLM usage parsing) but does not block malicious payloads. A malicious allowed host could return harmful data to Bob. Response-level policy (content filtering, size limits) is not implemented.
 
 **2. DNS rebinding attacks (mitigated with CIDR rules)**
 
@@ -200,7 +200,7 @@ Alice logs all policy decisions as structured JSON:
 - Denied requests: host, path (if inspected), rule index or "default deny"
 - Connection errors: upstream TLS failures, timeouts, etc.
 
-Sensitive data (request/response bodies, headers) is NOT logged by default.
+Sensitive data (request/response bodies, headers) is NOT logged by default. When `log_dir` is set in `[proxy]`, Alice writes full request/response bodies as JSON files to that directory. This is opt-in and intended for debugging; do not enable in production without understanding the disk and privacy implications.
 
 ## Credential Injection Security
 
@@ -212,7 +212,7 @@ Alice can inject real credentials into outbound requests, replacing dummy tokens
 |--------|--------|-----------------|
 | Environment | `env = "VAR"` | Process environment |
 | File | `file = "/path"` | Filesystem |
-| SOPS | `sops_credentials = [...]` | Encrypted file, decrypted at startup |
+| SOPS | `sops exec-env` wrapper | Encrypted file, decrypted into env vars by SOPS before Alice starts |
 
 ### Local Attacker (Eve) Threat Model
 
@@ -263,6 +263,14 @@ To extract SOPS secrets, Eve must either:
 1. Dump Alice's process memory (requires `CAP_SYS_PTRACE` or same UID)
 2. Have access to the same decryption keys (age key file, GPG keyring, KMS permissions)
 
+### GCP Credential Re-signing
+
+Alice can hold real GCP service account private keys and generate dummy keys for Bob. When Bob authenticates with Google using the dummy key, Alice intercepts the JWT assertion at the token endpoint and re-signs it with the real key before forwarding.
+
+This is a stronger form of credential injection: Bob never sees the real private key, only a dummy that Alice generated. The same trust boundaries apply — the real key exists only in Alice's memory and is subject to the same extraction risks as other credentials (memory dump by same-user process).
+
+For GCP user credentials (refresh token flow), Alice reads the real gcloud credentials and generates dummy versions for Bob. Refresh token swaps happen transparently at the token endpoint.
+
 ### Defense in Depth: Proxy Authentication
 
 Credential extraction and credential *usage through Alice* are separate concerns:
@@ -291,6 +299,19 @@ For high-security deployments:
 For convenience (development/testing):
 - Environment variables are acceptable when Eve is not a concern
 - File-based secrets work well with container secrets or tmpfs mounts
+
+## Request Transforms
+
+Alice supports a configurable transform pipeline that can modify outbound requests before they reach upstream. Transforms include:
+
+- **Injection scanning** — pattern matching on message content to detect prompt injection attempts
+- **Tool filtering** — allow/deny lists for tool names in LLM API requests
+- **System prompt enforcement** — prepend or replace system prompts
+- **Message swaps** — rewrite message content based on pattern matching
+
+These are **best-effort guardrails, not security boundaries**. A determined Bob could craft requests that bypass pattern matching (encoding tricks, semantic rephrasing, etc.). Transforms reduce the attack surface for accidental or naive misuse but should not be relied on as the sole defense against a motivated adversary.
+
+Transforms run after TLS termination and before the request is forwarded upstream. They only apply to requests matching configured host/path patterns (typically LLM API endpoints).
 
 ## Operational Security
 

@@ -8,7 +8,7 @@ use crate::proxy::ProxyState;
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use h2::server::SendResponse;
-use h2::{Reason, RecvStream};
+use h2::RecvStream;
 use http::{HeaderMap, Request};
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -33,12 +33,32 @@ where
     C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    // Perform HTTP/2 handshakes
-    let mut client_conn = h2::server::handshake(client_tls)
+    // Use large flow control windows for proxy workloads. The HTTP/2 spec
+    // default (65535 bytes) is shared across ALL concurrent streams on a
+    // connection. Cargo can open 100+ simultaneous index fetches on a single
+    // H2 connection — with real network RTT, the bandwidth-delay product
+    // quickly exceeds a small connection window and streams stall waiting
+    // for WINDOW_UPDATE frames, triggering curl's "less than 10 bytes/sec"
+    // timeout. 16 MiB gives ~160 KB per stream at 100 concurrent streams,
+    // enough to sustain transfer even with 50-100ms RTT to CDN edges.
+    const CONNECTION_WINDOW: u32 = 16 * 1024 * 1024; // 16 MiB
+    const STREAM_WINDOW: u32 = 2 * 1024 * 1024; // 2 MiB
+
+    // Perform HTTP/2 handshakes with tuned windows.
+    // Cap max_concurrent_streams on the server side so we don't accept more
+    // streams from the client than a typical CDN upstream will serve at once.
+    let mut client_conn = h2::server::Builder::new()
+        .initial_window_size(STREAM_WINDOW)
+        .initial_connection_window_size(CONNECTION_WINDOW)
+        .max_concurrent_streams(200)
+        .handshake(client_tls)
         .await
         .context("HTTP/2 server handshake failed")?;
 
-    let (upstream_send, upstream_conn) = h2::client::handshake(upstream_tls)
+    let (upstream_send, upstream_conn) = h2::client::Builder::new()
+        .initial_window_size(STREAM_WINDOW)
+        .initial_connection_window_size(CONNECTION_WINDOW)
+        .handshake(upstream_tls)
         .await
         .context("HTTP/2 client handshake failed")?;
 
@@ -48,6 +68,9 @@ where
             debug!(error = %e, "upstream HTTP/2 connection ended");
         }
     });
+
+    // Track spawned stream handlers so we can wait for them to finish
+    let mut stream_tasks = tokio::task::JoinSet::new();
 
     // Process incoming streams from client
     while let Some(result) = client_conn.accept().await {
@@ -59,7 +82,7 @@ where
         let resolved_ips = resolved_ips.clone();
         let client_addr = client_addr.clone();
 
-        tokio::spawn(
+        stream_tasks.spawn(
             async move {
                 if let Err(e) = handle_stream(
                     request,
@@ -79,7 +102,11 @@ where
         );
     }
 
-    // Client connection closed, clean up
+    // Client stopped sending new streams. Wait for in-flight handlers to
+    // finish (they may still be forwarding response data) before tearing
+    // down the upstream connection that they depend on.
+    drop(upstream_send); // release our clone so upstream closes when tasks finish
+    while stream_tasks.join_next().await.is_some() {}
     upstream_handle.abort();
     Ok(())
 }
@@ -100,8 +127,16 @@ where
     C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    // Use larger flow control windows (see proxy_h2 for rationale)
+    const STREAM_WINDOW: u32 = 2 * 1024 * 1024;
+    const CONNECTION_WINDOW: u32 = 16 * 1024 * 1024;
+
     // Perform HTTP/2 handshake with client
-    let mut client_conn = h2::server::handshake(client_tls)
+    let mut client_conn = h2::server::Builder::new()
+        .initial_window_size(STREAM_WINDOW)
+        .initial_connection_window_size(CONNECTION_WINDOW)
+        .max_concurrent_streams(200)
+        .handshake(client_tls)
         .await
         .context("HTTP/2 server handshake failed")?;
 
@@ -203,7 +238,8 @@ where
             response_body: &[],
         };
         deny.record_deny(&request_span, &state.metrics, "h2->h1");
-        respond.send_reset(Reason::REFUSED_STREAM);
+        let deny_response = http::Response::builder().status(403).body(()).unwrap();
+        let _ = respond.send_response(deny_response, true);
         return Ok(());
     }
 
@@ -239,7 +275,8 @@ where
     if let Some(TransformResult::Block { .. }) =
         request::apply_transforms(&state.transform_pipeline, &host, &path, &mut body_bytes)
     {
-        respond.send_reset(Reason::REFUSED_STREAM);
+        let deny_response = http::Response::builder().status(403).body(()).unwrap();
+        let _ = respond.send_response(deny_response, true);
         return Ok(());
     }
 
@@ -363,12 +400,19 @@ where
     let mut response_builder = http::Response::builder().status(status_code);
     for (name, value) in &response_headers {
         // Skip hop-by-hop headers
-        if !matches!(
+        if matches!(
             name.as_str(),
             "connection" | "keep-alive" | "transfer-encoding" | "upgrade"
         ) {
-            response_builder = response_builder.header(name.as_str(), value.as_str());
+            continue;
         }
+        // Update content-length to match (possibly redacted) body
+        if name == "content-length" && decision.redact_tokens {
+            response_builder =
+                response_builder.header("content-length", response_body.len().to_string());
+            continue;
+        }
+        response_builder = response_builder.header(name.as_str(), value.as_str());
     }
     let h2_response = response_builder
         .body(())
@@ -511,7 +555,8 @@ async fn handle_stream(
             response_body: &[],
         };
         deny.record_deny(&request_span, &state.metrics, "h2");
-        respond.send_reset(Reason::REFUSED_STREAM);
+        let deny_response = http::Response::builder().status(403).body(()).unwrap();
+        let _ = respond.send_response(deny_response, true);
         return Ok(());
     }
 
@@ -541,6 +586,9 @@ async fn handle_stream(
         && !body.is_end_stream())
         || needs_gcp_resign;
 
+    // Only capture body bytes into memory when logging is enabled
+    let needs_body_capture = state.log_dir.is_some();
+
     // Build the request to send upstream (without body)
     let upstream_request = http::Request::from_parts(parts, ());
 
@@ -552,8 +600,8 @@ async fn handle_stream(
         .await
         .context("upstream not ready for request")?;
 
-    // Send request and body to upstream, returning (response_future, captured_body)
-    let (upstream_response, request_body_buf) = if needs_body_transform {
+    // Send request and body to upstream, returning (response_future, captured_body, body_len)
+    let (upstream_response, request_body_buf, request_body_len) = if needs_body_transform {
         // Buffer the entire body, run transforms, then send
         let mut buf = Vec::new();
         while let Some(chunk) = body.data().await {
@@ -568,7 +616,8 @@ async fn handle_stream(
         if let Some(TransformResult::Block { .. }) =
             request::apply_transforms(&state.transform_pipeline, &host, &path, &mut buf)
         {
-            respond.send_reset(Reason::REFUSED_STREAM);
+            let deny_response = http::Response::builder().status(403).body(()).unwrap();
+            let _ = respond.send_response(deny_response, true);
             return Ok(());
         }
 
@@ -591,11 +640,13 @@ async fn handle_stream(
                 .context("failed to send modified body to upstream")?;
         }
 
+        let len = buf.len();
         (
             response_fut
                 .await
                 .context("failed to receive upstream response")?,
             buf,
+            len,
         )
     } else {
         // Stream body through without buffering
@@ -604,10 +655,14 @@ async fn handle_stream(
             .context("failed to send request to upstream")?;
 
         let mut body_buf = Vec::new();
+        let mut body_len: usize = 0;
         if !body_is_end {
             while let Some(chunk) = body.data().await {
                 let data = chunk.context("error reading client body")?;
-                body_buf.extend_from_slice(&data);
+                body_len += data.len();
+                if needs_body_capture {
+                    body_buf.extend_from_slice(&data);
+                }
                 body.flow_control()
                     .release_capacity(data.len())
                     .context("failed to release client flow control")?;
@@ -635,6 +690,7 @@ async fn handle_stream(
                 .await
                 .context("failed to receive upstream response")?,
             body_buf,
+            body_len,
         )
     };
 
@@ -649,12 +705,12 @@ async fn handle_stream(
         llm::is_messages_endpoint(&path) && llm::is_sse_header_map(&response_parts.headers);
 
     // Build response to send to client
-    let client_response = http::Response::from_parts(response_parts, ());
+    let mut client_response = http::Response::from_parts(response_parts, ());
 
     let upstream_body_is_end = upstream_body.is_end_stream();
 
     // Handle response body - buffer for redaction, stream otherwise
-    let response_body_buf = if decision.redact_tokens {
+    let (response_body_buf, response_body_len) = if decision.redact_tokens {
         // Token redaction requires buffering the entire body to modify JSON
         let mut response_body_buf = Vec::new();
         if !upstream_body_is_end {
@@ -678,6 +734,14 @@ async fn handle_stream(
             response_body_buf
         };
 
+        // Update content-length to match (possibly redacted) body
+        if client_response.headers().contains_key("content-length") {
+            client_response.headers_mut().insert(
+                http::header::CONTENT_LENGTH,
+                http::HeaderValue::from_str(&response_body_buf.len().to_string()).unwrap(),
+            );
+        }
+
         // Send buffered response
         let end_stream = response_body_buf.is_empty() && upstream_body_is_end;
         let mut client_send_body = respond
@@ -694,7 +758,8 @@ async fn handle_stream(
                 .context("failed to end client body")?;
         }
 
-        response_body_buf
+        let len = response_body_buf.len();
+        (response_body_buf, len)
     } else {
         // Stream response through without buffering (for SSE, large responses, etc.)
         // Send response headers immediately
@@ -709,13 +774,16 @@ async fn handle_stream(
             None
         };
 
-        // Stream body chunks, capturing for logging
+        // Stream body chunks, only capturing for logging when log_dir is set
         let mut response_body_buf = Vec::new();
+        let mut response_body_len: usize = 0;
         if !upstream_body_is_end {
             while let Some(chunk) = upstream_body.data().await {
                 let data = chunk.context("error reading upstream body")?;
-                // Capture for logging
-                response_body_buf.extend_from_slice(&data);
+                response_body_len += data.len();
+                if needs_body_capture {
+                    response_body_buf.extend_from_slice(&data);
+                }
                 // Feed to LLM metrics accumulator
                 if let Some(ref mut acc) = llm_acc {
                     acc.process_chunk(&data);
@@ -752,7 +820,7 @@ async fn handle_stream(
             acc.emit(&host, &path, Some(&state.llm_metrics));
         }
 
-        response_body_buf
+        (response_body_buf, response_body_len)
     };
 
     // Record span, metrics, and log the exchange
@@ -763,8 +831,8 @@ async fn handle_stream(
         status_code: response_status,
         action: "allow",
         rule_index: decision.rule_index,
-        request_bytes: request_headers_raw.len() + request_body_buf.len(),
-        response_bytes: response_headers_raw.len() + response_body_buf.len(),
+        request_bytes: request_headers_raw.len() + request_body_len,
+        response_bytes: response_headers_raw.len() + response_body_len,
         start: request_start,
         client_addr: &client_addr,
         request_headers: &request_headers_raw,

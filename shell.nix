@@ -9,4 +9,6 @@ pkgs.mkShell {
     pkg-config
     openssl.dev
   ];
+
+  RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
 }

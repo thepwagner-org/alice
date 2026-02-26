@@ -145,6 +145,16 @@ sops -e secrets.env > secrets.enc.env
 sops exec-env secrets.enc.env -- alice -c config.toml
 ```
 
+## Performance
+
+Alice adds overhead for TLS inspection (dual handshake + CONNECT negotiation) but it's small relative to real-world internet latency. It's not designed for LAN proxying — it's designed to sit in front of the internet where the network dominates.
+Measured against Cloudflare's CDN (cargo test --test cloudflare):
+| Metric | Direct | Proxy | Overhead |
+| --- | --- | --- | --- |
+| Connection time (p50) | 107ms | 155ms | +49ms (+46%) |
+| Throughput (1 MB) | 11.5 MB/s | 12.6 MB/s | +9ms (+12%) |
+| Throughput (25 MB) | 49.5 MB/s | 48.5 MB/s | +108ms (+32%) |
+
 ## Security Model
 
 See [SECURITY.md](SECURITY.md) for the full threat model, trust boundaries, and credential storage analysis.

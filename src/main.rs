@@ -32,10 +32,11 @@ async fn main() -> Result<()> {
         .observability
         .as_ref()
         .and_then(|o| o.otlp_endpoint.as_deref());
-    let _tracing_guard = telemetry::init_tracing("alice", "info", args.json, otlp_endpoint);
+    let tracing_guard = telemetry::init_tracing(args.json, otlp_endpoint);
 
     info!(listen = %config.proxy.listen, "starting alice proxy");
 
-    // Run proxy with graceful shutdown
-    proxy::run(config).await
+    // Run proxy with graceful shutdown.
+    // Pass parent trace context so the server span links to the nix-jail job trace.
+    proxy::run(config, tracing_guard.parent_context().cloned()).await
 }

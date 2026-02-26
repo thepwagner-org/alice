@@ -88,7 +88,7 @@ impl RequestOutcome<'_> {
     /// Record a denied request: span fields, info log, and deny metric.
     ///
     /// The caller is still responsible for sending the transport-specific
-    /// rejection (H1 403 response vs H2 RST_STREAM).
+    /// rejection (H1 `403 Forbidden` response or H2 403 response frame).
     pub fn record_deny(&self, span: &Span, metrics: &ProxyMetrics, protocol_tag: &str) {
         self.record_span(span);
         info!(

@@ -96,6 +96,21 @@ impl CertificateAuthority {
         Ok(cert)
     }
 
+    /// Pre-generate and cache certificates for the given hosts.
+    /// Returns the number of certs successfully generated.
+    pub async fn warm_certs(&self, hosts: &[String]) -> usize {
+        let mut count = 0;
+        for host in hosts {
+            match self.get_or_create_cert(host).await {
+                Ok(_) => count += 1,
+                Err(e) => {
+                    tracing::warn!(host = %host, error = %e, "failed to pre-generate certificate");
+                }
+            }
+        }
+        count
+    }
+
     fn generate_host_cert(&self, host: &str) -> Result<HostCert> {
         let key = KeyPair::generate()?;
 

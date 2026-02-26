@@ -75,6 +75,11 @@ pub struct CaConfig {
     /// Per-host certificate validity in hours (default: 2)
     #[serde(default = "default_host_cert_validity")]
     pub host_cert_validity_hours: u32,
+    /// Hosts to pre-generate certificates for at startup.
+    /// Exact hosts from rules and credentials are warmed automatically;
+    /// use this for hosts behind glob or CIDR rules.
+    #[serde(default)]
+    pub warm_hosts: Vec<String>,
 }
 
 fn default_ca_validity() -> u32 {
@@ -265,5 +270,29 @@ host = "*"
         assert_eq!(config.rules[0].host, Some("*.httpbin.org".to_string()));
         assert_eq!(config.rules[0].path, Some("/get".to_string()));
         assert_eq!(config.rules[0].cidr, None);
+        // warm_hosts defaults to empty when omitted
+        assert!(config.ca.warm_hosts.is_empty());
+    }
+
+    #[test]
+    fn test_parse_warm_hosts() {
+        let toml = r#"
+[proxy]
+listen = "127.0.0.1:3128"
+
+[ca]
+cert_path = "/tmp/alice-ca.pem"
+warm_hosts = ["api.github.com", "index.crates.io"]
+
+[[rules]]
+action = "allow"
+host = "*.github.com"
+"#;
+
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(
+            config.ca.warm_hosts,
+            vec!["api.github.com", "index.crates.io"]
+        );
     }
 }

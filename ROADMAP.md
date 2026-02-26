@@ -8,6 +8,7 @@
 - **WebSocket inspection**
 - **Rate limiting** per host or credential
 - **Connection pooling tuning**
+- **AWS credential re-signing** - Proxy-side SigV4 signing for AWS APIs (analogous to GCP JWT re-signing)
 
 ## Non-Goals
 

@@ -1,6 +1,6 @@
 //! Shared test infrastructure for integration tests and benchmarks.
+#![allow(dead_code)]
 
-use std::net::SocketAddr;
 use std::sync::{Arc, Once};
 use std::time::Duration;
 
@@ -64,19 +64,20 @@ pub fn generate_server_cert(host: &str) -> (CertificateDer<'static>, PrivateKeyD
 // Mock HTTPS Server
 // ============================================================================
 
-/// Spawn a mock HTTPS server on the given port, returns the server's self-signed cert (PEM)
-pub async fn spawn_https_server(port: u16) -> (String, tokio::task::JoinHandle<()>) {
-    spawn_https_server_with_app(port, default_router(), true).await
+/// Spawn a mock HTTPS server on an OS-assigned port.
+/// Returns (port, cert_pem, handle).
+pub async fn spawn_https_server() -> (u16, String, tokio::task::JoinHandle<()>) {
+    spawn_https_server_with_app(default_router(), true).await
 }
 
-/// Spawn a mock HTTPS server with a custom router
+/// Spawn a mock HTTPS server with a custom router on an OS-assigned port.
+/// Binds to port 0 to avoid TOCTOU races when tests run in parallel.
+/// Returns (port, cert_pem, handle).
 pub async fn spawn_https_server_with_app(
-    port: u16,
     app: Router,
     enable_h2: bool,
-) -> (String, tokio::task::JoinHandle<()>) {
+) -> (u16, String, tokio::task::JoinHandle<()>) {
     init_crypto_provider();
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
 
     let (cert_der, key_der) = generate_server_cert("localhost");
 
@@ -98,7 +99,12 @@ pub async fn spawn_https_server_with_app(
     let tls_acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
     let cert_pem = pem::encode(&pem::Pem::new("CERTIFICATE", cert_der.as_ref()));
 
-    let listener = TcpListener::bind(addr).await.expect("bind listener");
+    // Bind to port 0 — the OS assigns an available port atomically,
+    // eliminating the TOCTOU race in find_available_port().
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind listener");
+    let port = listener.local_addr().expect("local addr").port();
     let handle = tokio::spawn(async move {
         loop {
             let Ok((stream, _addr)) = listener.accept().await else {
@@ -142,7 +148,7 @@ pub async fn spawn_https_server_with_app(
     // Wait for server to be ready
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    (cert_pem, handle)
+    (port, cert_pem, handle)
 }
 
 fn default_router() -> Router {
@@ -596,4 +602,170 @@ pub async fn find_available_port() -> u16 {
     let port = listener.local_addr().expect("local addr").port();
     drop(listener);
     port
+}
+
+// ============================================================================
+// Performance Test Helpers
+// ============================================================================
+
+/// Statistics from multiple timing samples
+pub struct Stats {
+    pub samples: Vec<Duration>,
+}
+
+impl Stats {
+    pub fn new() -> Self {
+        Self { samples: vec![] }
+    }
+
+    pub fn add(&mut self, d: Duration) {
+        self.samples.push(d);
+    }
+
+    pub fn p50(&self) -> Duration {
+        let mut sorted = self.samples.clone();
+        sorted.sort();
+        sorted[sorted.len() / 2]
+    }
+
+    pub fn p99(&self) -> Duration {
+        let mut sorted = self.samples.clone();
+        sorted.sort();
+        let idx = (sorted.len() as f64 * 0.99) as usize;
+        sorted[idx.min(sorted.len() - 1)]
+    }
+
+    pub fn min(&self) -> Duration {
+        *self.samples.iter().min().unwrap()
+    }
+
+    pub fn max(&self) -> Duration {
+        *self.samples.iter().max().unwrap()
+    }
+
+    pub fn mean(&self) -> Duration {
+        let total: Duration = self.samples.iter().sum();
+        total / self.samples.len() as u32
+    }
+}
+
+pub fn format_duration(d: Duration) -> String {
+    let micros = d.as_micros();
+    if micros < 1000 {
+        format!("{}us", micros)
+    } else if micros < 1_000_000 {
+        format!("{:.2}ms", micros as f64 / 1000.0)
+    } else {
+        format!("{:.2}s", micros as f64 / 1_000_000.0)
+    }
+}
+
+pub fn format_throughput(bytes: usize, duration: Duration) -> String {
+    let mb = bytes as f64 / (1024.0 * 1024.0);
+    let secs = duration.as_secs_f64();
+    let mbps = mb / secs;
+    format!("{:.1} MB/s", mbps)
+}
+
+pub fn format_overhead(direct: Duration, proxy: Duration) -> String {
+    if proxy >= direct {
+        let delta = proxy - direct;
+        let pct = if direct.is_zero() {
+            0.0
+        } else {
+            (delta.as_secs_f64() / direct.as_secs_f64()) * 100.0
+        };
+        format!("+{} (+{:.0}%)", format_duration(delta), pct)
+    } else {
+        let delta = direct - proxy;
+        let pct = if direct.is_zero() {
+            0.0
+        } else {
+            (delta.as_secs_f64() / direct.as_secs_f64()) * 100.0
+        };
+        format!("-{} (-{:.0}%)", format_duration(delta), pct)
+    }
+}
+
+pub fn print_stats(name: &str, stats: &Stats) {
+    println!(
+        "  {:<30} p50={:<10} p99={:<10} min={:<10} max={:<10}",
+        name,
+        format_duration(stats.p50()),
+        format_duration(stats.p99()),
+        format_duration(stats.min()),
+        format_duration(stats.max()),
+    );
+}
+
+pub fn print_throughput_comparison(label: &str, size: usize, direct: &Stats, proxy: &Stats) {
+    println!("  {}:", label);
+    println!(
+        "    {:<10} {}  (p50={}, p99={})",
+        "direct",
+        format_throughput(size, direct.mean()),
+        format_duration(direct.p50()),
+        format_duration(direct.p99()),
+    );
+    println!(
+        "    {:<10} {}  (p50={}, p99={})",
+        "proxy",
+        format_throughput(size, proxy.mean()),
+        format_duration(proxy.p50()),
+        format_duration(proxy.p99()),
+    );
+    println!(
+        "    {:<10} {}",
+        "overhead",
+        format_overhead(direct.p50(), proxy.p50()),
+    );
+}
+
+/// Measure throughput: warm up once, then time N iterations of GET + full body read.
+pub async fn measure_throughput(
+    client: &reqwest::Client,
+    url: &str,
+    expected_size: usize,
+    iterations: usize,
+) -> Stats {
+    // Warm up
+    let _ = client.get(url).send().await.unwrap().bytes().await;
+
+    let mut stats = Stats::new();
+    for _ in 0..iterations {
+        let start = std::time::Instant::now();
+        let resp = tokio::time::timeout(Duration::from_secs(30), client.get(url).send())
+            .await
+            .expect("timeout")
+            .expect("request");
+        let bytes = resp.bytes().await.expect("read body");
+        let elapsed = start.elapsed();
+        assert_eq!(bytes.len(), expected_size);
+        stats.add(elapsed);
+    }
+    stats
+}
+
+/// Spawn the proxy with a perf-test policy and return the proxy CA cert.
+pub async fn spawn_perf_proxy(
+    proxy_port: u16,
+    rules: Vec<RuleSpec>,
+    upstream_cert_pem: Option<&str>,
+    temp_dir: &tempfile::TempDir,
+) -> (reqwest::Certificate, tokio::task::JoinHandle<()>) {
+    let proxy_handle = spawn_proxy(
+        ProxyConfig {
+            listen_port: proxy_port,
+            rules,
+            upstream_ca_pem: upstream_cert_pem.map(|s| s.to_string()),
+            ..Default::default()
+        },
+        temp_dir,
+    )
+    .await;
+
+    let proxy_ca = std::fs::read_to_string(temp_dir.path().join("ca.pem")).expect("read CA");
+    let proxy_ca_cert = reqwest::Certificate::from_pem(proxy_ca.as_bytes()).expect("parse CA");
+
+    (proxy_ca_cert, proxy_handle)
 }

@@ -7,6 +7,7 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info, info_span, warn, Instrument};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 #[cfg(unix)]
 use tokio::signal::unix::{signal, SignalKind};
@@ -54,7 +55,7 @@ pub struct ProxyState {
     pub transform_pipeline: TransformPipeline,
 }
 
-pub async fn run(config: Config) -> Result<()> {
+pub async fn run(config: Config, parent_context: Option<opentelemetry::Context>) -> Result<()> {
     // Initialize CA and write cert for clients
     let ca =
         CertificateAuthority::new(config.ca.validity_hours, config.ca.host_cert_validity_hours)?;
@@ -64,6 +65,39 @@ pub async fn run(config: Config) -> Result<()> {
     // Initialize policy engine
     let policy = PolicyEngine::new(&config.rules)?;
     debug!(rules = config.rules.len(), "loaded policy rules");
+
+    // Pre-generate certs for exact (non-glob) hosts from rules and credentials,
+    // plus any explicitly configured warm_hosts.
+    let warm_hosts: Vec<String> = {
+        let hosts: std::collections::HashSet<String> = config
+            .ca
+            .warm_hosts
+            .iter()
+            .cloned()
+            .chain(
+                config
+                    .rules
+                    .iter()
+                    .filter_map(|r| r.host.as_ref())
+                    .chain(config.credentials.iter().map(|c| &c.host))
+                    .filter(|h| {
+                        !h.contains('*') && !h.contains('?') && !h.contains('[') && !h.contains('{')
+                    })
+                    .cloned(),
+            )
+            .collect();
+        // warm_hosts from config are always included, even if they look like globs
+        // (the user knows what they want)
+        hosts.into_iter().collect()
+    };
+    if !warm_hosts.is_empty() {
+        let warmed = ca.warm_certs(&warm_hosts).await;
+        info!(
+            count = warmed,
+            total = warm_hosts.len(),
+            "pre-generated certificates for known hosts"
+        );
+    }
 
     // Initialize DNS resolver with host overrides
     let dns_overrides = config
@@ -161,102 +195,141 @@ pub async fn run(config: Config) -> Result<()> {
 
     // Bind listener
     let listener = TcpListener::bind(&config.proxy.listen).await?;
-    debug!(addr = %config.proxy.listen, "listening for connections");
+    info!(addr = %config.proxy.listen, "listening for connections");
 
-    // Server lifecycle span
+    // Server lifecycle span — covers the entire accept loop.
+    // Uses .instrument() so the span is properly entered/exited around each
+    // async poll, making it "current" for child spans on any worker thread.
+    //
+    // We attach the parent OTel context to thread-local BEFORE creating the
+    // span. The OTel layer reads Context::current() in on_new_span to assign
+    // the trace_id. set_parent() alone updates the *exported* span but
+    // children inherit the trace_id assigned at creation time — causing a
+    // trace split where server lives in trace B but conn/request end up in
+    // an orphaned trace A.
+    //
+    // SAFETY: No .await between attach() and drop() — the guard never
+    // crosses a yield point, so the thread-local context is scoped to this
+    // thread for the duration of the synchronous info_span!() call.
+    let _parent_guard = parent_context.as_ref().map(|cx| cx.clone().attach());
     let server_span = info_span!(
         "server",
         service.name = "alice",
+        service.version = crate::telemetry::version(),
         server.address = %config.proxy.listen,
     );
-    let _server_guard = server_span.enter();
+    drop(_parent_guard);
 
-    // Setup graceful shutdown
-    #[cfg(unix)]
-    let mut sigterm = signal(SignalKind::terminate())?;
-    let shutdown = async {
-        #[cfg(unix)]
-        {
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {
-                    info!("received SIGINT, shutting down");
-                }
-                _ = sigterm.recv() => {
-                    info!("received SIGTERM, shutting down");
-                }
+    // Also call set_parent so that server_span.context() returns the right
+    // parent info for any code that inspects it directly.
+    if let Some(cx) = parent_context {
+        match server_span.set_parent(cx) {
+            Ok(()) => {
+                use opentelemetry::trace::TraceContextExt;
+                let otel_cx = server_span.context();
+                let sc = otel_cx.span().span_context().clone();
+                info!(
+                    trace_id = %sc.trace_id(),
+                    span_id = %sc.span_id(),
+                    "linked server span to parent trace context"
+                );
             }
-        }
-        #[cfg(not(unix))]
-        {
-            tokio::signal::ctrl_c().await.ok();
-            info!("received shutdown signal");
-        }
-    };
-    tokio::pin!(shutdown);
-
-    // Accept connections with graceful shutdown
-    loop {
-        tokio::select! {
-            _ = &mut shutdown => {
-                info!("server shutting down gracefully");
-                // Small delay to allow in-flight spans to be batched and sent
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                break;
-            }
-            result = listener.accept() => {
-                match result {
-                    Ok((stream, addr)) => {
-                        // Acquire connection permit (blocks if at limit)
-                        let permit = match connection_limit.clone().try_acquire_owned() {
-                            Ok(permit) => permit,
-                            Err(_) => {
-                                // At connection limit - try to acquire with brief wait
-                                warn!(addr = %addr, "connection limit reached, waiting");
-                                match tokio::time::timeout(
-                                    Duration::from_secs(5),
-                                    connection_limit.clone().acquire_owned(),
-                                )
-                                .await
-                                {
-                                    Ok(Ok(permit)) => permit,
-                                    _ => {
-                                        warn!(addr = %addr, "connection rejected: limit exceeded");
-                                        drop(stream);
-                                        continue;
-                                    }
-                                }
-                            }
-                        };
-
-                        let state = Arc::clone(&state);
-                        let span = info_span!("conn", %addr);
-                        tokio::spawn(
-                            async move {
-                                // Permit is held for duration of connection
-                                let _permit = permit;
-                                // Track active connections in Prometheus
-                                let _conn_guard = prom::ConnectionGuard::new(&state.metrics);
-                                if let Err(e) = http::handle_connection(stream, state).await {
-                                    let msg = e.to_string();
-                                    if msg.contains("close_notify")
-                                        || msg.contains("Connection reset")
-                                    {
-                                        debug!(error = %e, "connection closed by peer");
-                                    } else {
-                                        error!(error = %e, "connection error");
-                                    }
-                                }
-                            }
-                            .instrument(span),
-                        );
-                    }
-                    Err(e) => {
-                        error!(error = %e, "accept error");
-                    }
-                }
-            }
+            Err(e) => warn!(error = %e, "failed to set parent trace context on server span"),
         }
     }
 
-    Ok(())
+    // The accept loop is instrumented with server_span so that:
+    // 1. The OTel layer initialises the span's trace/span IDs on first enter
+    // 2. conn spans created inside automatically inherit server as parent
+    // 3. Thread-local context is correct regardless of tokio worker thread
+    async move {
+        #[cfg(unix)]
+        let mut sigterm = signal(SignalKind::terminate())?;
+        let shutdown = async {
+            #[cfg(unix)]
+            {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {
+                        info!("received SIGINT, shutting down");
+                    }
+                    _ = sigterm.recv() => {
+                        info!("received SIGTERM, shutting down");
+                    }
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                tokio::signal::ctrl_c().await.ok();
+                info!("received shutdown signal");
+            }
+        };
+        tokio::pin!(shutdown);
+
+        loop {
+            tokio::select! {
+                _ = &mut shutdown => {
+                    info!("server shutting down gracefully");
+                    // Small delay to allow in-flight spans to be batched and sent
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    break;
+                }
+                result = listener.accept() => {
+                    match result {
+                        Ok((stream, addr)) => {
+                            // Acquire connection permit (blocks if at limit)
+                            let permit = match connection_limit.clone().try_acquire_owned() {
+                                Ok(permit) => permit,
+                                Err(_) => {
+                                    // At connection limit - try to acquire with brief wait
+                                    warn!(addr = %addr, "connection limit reached, waiting");
+                                    match tokio::time::timeout(
+                                        Duration::from_secs(5),
+                                        connection_limit.clone().acquire_owned(),
+                                    )
+                                    .await
+                                    {
+                                        Ok(Ok(permit)) => permit,
+                                        _ => {
+                                            warn!(addr = %addr, "connection rejected: limit exceeded");
+                                            drop(stream);
+                                            continue;
+                                        }
+                                    }
+                                }
+                            };
+
+                            let state = Arc::clone(&state);
+                            let span = info_span!("conn", %addr);
+                            tokio::spawn(
+                                async move {
+                                    // Permit is held for duration of connection
+                                    let _permit = permit;
+                                    // Track active connections in Prometheus
+                                    let _conn_guard = prom::ConnectionGuard::new(&state.metrics);
+                                    if let Err(e) = http::handle_connection(stream, state).await {
+                                        let msg = e.to_string();
+                                        if msg.contains("close_notify")
+                                            || msg.contains("Connection reset")
+                                        {
+                                            debug!(error = %e, "connection closed by peer");
+                                        } else {
+                                            error!(error = %e, "connection error");
+                                        }
+                                    }
+                                }
+                                .instrument(span),
+                            );
+                        }
+                        Err(e) => {
+                            error!(error = %e, "accept error");
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+    .instrument(server_span)
+    .await
 }
