@@ -12,6 +12,7 @@ You have a process that needs to call authenticated APIs - but you don't trust i
 
 Alice sits between the client ("Bob") and the internet. Bob sends requests with **dummy tokens** - placeholders like `Bearer DUMMY_GITHUB`. Alice intercepts the request, swaps the dummy for the **real secret** (loaded from an env var, file, or SOPS-encrypted store), and forwards it upstream.
 Bob never sees the real credential. It exists only in Alice's memory.
+
 ```mermaid
 sequenceDiagram
     box rgba(255, 200, 200, 0.1) Sandbox
@@ -55,6 +56,7 @@ sequenceDiagram
     API-->>-Eve: 401 Unauthorized
     deactivate Eve
 ```
+
 On top of credential injection, Alice enforces an **access control policy**: a default-deny allowlist of hosts and paths, evaluated with glob patterns. Bob can only reach what you explicitly permit - and credentials are scoped to specific hosts, so even a compromised client can't exfiltrate secrets to an attacker-controlled server.
 
 ## Features
@@ -79,16 +81,20 @@ On top of credential injection, Alice enforces an **access control policy**: a d
 cargo build
 cargo run -- -c examples/policies/httpbin.toml
 ```
+
 Configure your client to use the proxy and trust Alice's CA:
+
 ```sh
 export HTTPS_PROXY=http://127.0.0.1:3128
 curl --cacert /tmp/alice-ca.pem https://httpbin.org/get
 ```
+
 The CA certificate is generated fresh on each startup (default validity: 6 hours).
 
 ## Configuration
 
 Alice is configured with a TOML file. Here's a full example:
+
 ```toml
 [proxy]
 listen = "127.0.0.1:3128"
@@ -149,6 +155,7 @@ sops exec-env secrets.enc.env -- alice -c config.toml
 
 Alice adds overhead for TLS inspection (dual handshake + CONNECT negotiation) but it's small relative to real-world internet latency. It's not designed for LAN proxying — it's designed to sit in front of the internet where the network dominates.
 Measured against Cloudflare's CDN (cargo test --test cloudflare):
+
 | Metric | Direct | Proxy | Overhead |
 | --- | --- | --- | --- |
 | Connection time (p50) | 107ms | 155ms | +49ms (+46%) |

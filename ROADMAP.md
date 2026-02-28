@@ -13,6 +13,7 @@
 ## Non-Goals
 
 Explicitly out of scope to keep the project focused:
+
 - **Plain HTTP support** - HTTPS only
 - **Per-client proxy isolation** - single shared proxy
 - **Regex patterns for rules** - globs only
