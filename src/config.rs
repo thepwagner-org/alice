@@ -25,6 +25,21 @@ pub struct Config {
     /// Ordered list of request transforms for LLM API endpoints.
     #[serde(default)]
     pub transforms: Vec<TransformConfig>,
+    /// Optional reverse proxy configuration for inbound traffic to sandbox.
+    pub reverse_proxy: Option<ReverseProxyConfig>,
+}
+
+/// Reverse proxy configuration for forwarding host requests into the sandbox.
+///
+/// When configured, alice spawns a second listener that accepts plain HTTP
+/// from the host and forwards to a backend service in the job's network
+/// namespace (via the veth pair).
+#[derive(Debug, Deserialize)]
+pub struct ReverseProxyConfig {
+    /// Address to listen on (e.g., "127.0.0.1:0" for ephemeral port)
+    pub listen: String,
+    /// Backend address to forward to (e.g., "10.0.0.2:3337")
+    pub backend: String,
 }
 
 /// Observability configuration for metrics and distributed tracing
@@ -272,6 +287,40 @@ host = "*"
         assert_eq!(config.rules[0].cidr, None);
         // warm_hosts defaults to empty when omitted
         assert!(config.ca.warm_hosts.is_empty());
+    }
+
+    #[test]
+    fn test_parse_reverse_proxy() {
+        let toml = r#"
+[proxy]
+listen = "127.0.0.1:3128"
+
+[ca]
+cert_path = "/tmp/alice-ca.pem"
+
+[reverse_proxy]
+listen = "127.0.0.1:0"
+backend = "10.0.0.2:3337"
+"#;
+
+        let config: Config = toml::from_str(toml).unwrap();
+        let rp = config.reverse_proxy.unwrap();
+        assert_eq!(rp.listen, "127.0.0.1:0");
+        assert_eq!(rp.backend, "10.0.0.2:3337");
+    }
+
+    #[test]
+    fn test_parse_no_reverse_proxy() {
+        let toml = r#"
+[proxy]
+listen = "127.0.0.1:3128"
+
+[ca]
+cert_path = "/tmp/alice-ca.pem"
+"#;
+
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.reverse_proxy.is_none());
     }
 
     #[test]

@@ -15,12 +15,14 @@ use tracing::{debug, warn};
 
 /// Spawn the metrics HTTP server on the given address.
 ///
-/// Returns a `JoinHandle` for the server task.
+/// Returns the actual bound address and a `JoinHandle` for the server task.
+/// The bound address may differ from `listen` when port 0 is used (OS assigns
+/// an ephemeral port).
 pub async fn spawn(
     listen: &str,
     store: LlmMetricsStore,
     prom: ProxyMetrics,
-) -> Result<tokio::task::JoinHandle<()>> {
+) -> Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>)> {
     let listener = TcpListener::bind(listen).await?;
     let addr = listener.local_addr()?;
     debug!(addr = %addr, "metrics server listening");
@@ -71,5 +73,5 @@ pub async fn spawn(
         }
     });
 
-    Ok(handle)
+    Ok((addr, handle))
 }

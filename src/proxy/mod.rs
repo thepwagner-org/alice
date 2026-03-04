@@ -23,6 +23,7 @@ pub mod metrics;
 mod policy;
 pub mod prom;
 mod request;
+pub mod reverse;
 mod tls;
 pub mod transform;
 
@@ -180,9 +181,20 @@ pub async fn run(config: Config, parent_context: Option<opentelemetry::Context>)
     // Spawn metrics server if configured
     if let Some(ref obs) = config.observability {
         if let Some(ref listen) = obs.metrics_listen {
-            let _metrics_handle = metrics::spawn(listen, llm_metrics, proxy_metrics).await?;
-            info!(addr = %listen, "metrics server started");
+            let (metrics_addr, _metrics_handle) =
+                metrics::spawn(listen, llm_metrics, proxy_metrics).await?;
+            info!(addr = %metrics_addr, "metrics server started");
         }
+    }
+
+    // Spawn reverse proxy if configured
+    if let Some(ref rp_config) = config.reverse_proxy {
+        let rp = reverse::ReverseProxyConfig {
+            listen: rp_config.listen.clone(),
+            backend: rp_config.backend.clone(),
+        };
+        let (bound_addr, _rp_handle) = reverse::spawn(rp).await?;
+        info!(addr = %bound_addr, backend = %rp_config.backend, "reverse proxy started");
     }
 
     // Connection limit semaphore
@@ -195,7 +207,8 @@ pub async fn run(config: Config, parent_context: Option<opentelemetry::Context>)
 
     // Bind listener
     let listener = TcpListener::bind(&config.proxy.listen).await?;
-    info!(addr = %config.proxy.listen, "listening for connections");
+    let listen_addr = listener.local_addr()?;
+    info!(addr = %listen_addr, "listening for connections");
 
     // Server lifecycle span — covers the entire accept loop.
     // Uses .instrument() so the span is properly entered/exited around each
