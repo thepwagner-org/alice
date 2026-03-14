@@ -166,3 +166,4 @@ Measured against Cloudflare's CDN (cargo test --test cloudflare):
 
 See [SECURITY.md](SECURITY.md) for the full threat model, trust boundaries, and credential storage analysis.
 The short version: Alice is designed for environments where Bob is untrusted or semi-trusted. Alice sees all plaintext traffic. Network-level enforcement (firewall rules, network namespaces, containers) is required to prevent Bob from bypassing the proxy.
+
