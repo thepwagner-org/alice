@@ -25,10 +25,12 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }}
       - name: Package
         run: |
-          bin=$(cargo metadata --format-version=1 --no-deps \
-            | jq -r '.packages[0].targets[] | select(.kind[] == "bin") | .name')
-          tar czf "${bin}-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz" \
-            -C "target/${{ matrix.target }}/release" "$bin"
+          meta=$(cargo metadata --format-version=1 --no-deps)
+          pkg=$(printf '%s' "$meta" | jq -r '.packages[0].name')
+          bins=$(printf '%s' "$meta" | jq -r '.packages[0].targets[] | select(.kind[] == "bin") | .name')
+          # shellcheck disable=SC2086
+          tar czf "${pkg}-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz" \
+            -C "target/${{ matrix.target }}/release" $bins
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: build-${{ matrix.target }}
