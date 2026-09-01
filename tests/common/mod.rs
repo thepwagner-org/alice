@@ -9,7 +9,8 @@
     unused_results
 )]
 
-use std::sync::{Arc, Once};
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex, Once};
 use std::time::Duration;
 
 use axum::{
@@ -25,7 +26,7 @@ use rcgen::{
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tempfile::TempDir;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 
 // Install the rustls ring crypto provider once for all tests.
 static INIT_CRYPTO: Once = Once::new();
@@ -422,15 +423,29 @@ host_cert_validity_hours = 1
         let _ = status;
     });
 
-    // Wait for proxy to start and write CA cert
-    for _ in 0..50 {
+    // Wait for the proxy to be reachable.
+    //
+    // Waiting on the CA cert alone was not enough: the proxy writes it before
+    // it binds, so a bind that lost a port race still left the file behind.
+    // The test then ran against a proxy that was not listening and failed
+    // later with an opaque client-side connect error. Probing the port
+    // reports the real problem here instead.
+    let addr = format!("127.0.0.1:{}", config.listen_port);
+    let mut listening = false;
+    for _ in 0..100 {
         tokio::time::sleep(Duration::from_millis(50)).await;
-        if ca_cert_path.exists() {
-            // Also wait a bit more for the listener to be ready
-            tokio::time::sleep(Duration::from_millis(50)).await;
+        if ca_cert_path.exists() && TcpStream::connect(&addr).await.is_ok() {
+            listening = true;
             break;
         }
     }
+    assert!(
+        listening,
+        "proxy never listened on {} (CA cert present: {}) -- \
+         it most likely failed to bind the port",
+        addr,
+        ca_cert_path.exists()
+    );
 
     handle
 }
@@ -439,12 +454,31 @@ host_cert_validity_hours = 1
 // Utility Functions
 // ============================================================================
 
-/// Find an available port for testing
+/// Ports already handed out by `find_available_port` in this process.
+///
+/// Binding port 0 and dropping the listener frees the port again, so two
+/// concurrent callers can be handed the same number before either has bound
+/// it for real. The integration suite runs ~30 tests in one process, which
+/// made that collision routine. Remembering what we issued removes it.
+static ISSUED_PORTS: Mutex<Option<HashSet<u16>>> = Mutex::new(None);
+
+/// Find an available port for testing.
+///
+/// Still a hint rather than a reservation -- a separate process can take the
+/// port between this call and the bind -- so callers must verify the server they
+/// start is actually reachable. `spawn_proxy` does.
 pub async fn find_available_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let port = listener.local_addr().expect("local addr").port();
-    drop(listener);
-    port
+    for _ in 0..100 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("local addr").port();
+        drop(listener);
+
+        let mut issued = ISSUED_PORTS.lock().expect("issued ports");
+        if issued.get_or_insert_with(HashSet::new).insert(port) {
+            return port;
+        }
+    }
+    panic!("could not find an unused port after 100 attempts");
 }
 
 // ============================================================================

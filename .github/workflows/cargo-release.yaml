@@ -21,6 +21,10 @@ jobs:
         with:
           persist-credentials: false
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+      # protoc for the vendored sanctum-client `build.rs`. The generated workflows
+      # run cargo directly rather than through the nix dev shell, so the `protobuf`
+      # in `project.nix` does not reach CI.
+      - uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b  # v3.0.0
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
       - name: Package
