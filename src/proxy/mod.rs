@@ -2,8 +2,9 @@ use crate::config::Config;
 use crate::credentials::CredentialStore;
 use anyhow::Result;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info, info_span, warn, Instrument};
@@ -13,11 +14,11 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 use tokio::signal::unix::{signal, SignalKind};
 
 mod certs;
+pub mod collector;
 mod dns;
 pub mod gcp;
 mod h2;
 mod http;
-pub mod llm;
 pub mod logging;
 pub mod metrics;
 mod policy;
@@ -25,14 +26,12 @@ pub mod prom;
 mod request;
 pub mod reverse;
 mod tls;
-pub mod transform;
 
 use certs::CertificateAuthority;
 use dns::DnsResolver;
 use gcp::GcpCredentialStore;
 use policy::PolicyEngine;
 use prom::ProxyMetrics;
-use transform::TransformPipeline;
 
 /// Shared state for all proxy connections
 pub struct ProxyState {
@@ -46,14 +45,12 @@ pub struct ProxyState {
     /// GCP service account credentials for proxy-side JWT re-signing
     pub gcp_credentials: GcpCredentialStore,
     pub idle_timeout: Duration,
+    /// Request-size limits (defense-in-depth against memory-exhaustion DoS)
+    pub limits: crate::config::Limits,
     /// Directory for request/response logs (development only)
     pub log_dir: Option<PathBuf>,
-    /// Accumulated LLM completion metrics (queryable via metrics endpoint)
-    pub llm_metrics: llm::LlmMetricsStore,
     /// Prometheus metrics (request counts, bytes, connections, credentials)
     pub metrics: ProxyMetrics,
-    /// Transform pipeline for LLM API request modification
-    pub transform_pipeline: TransformPipeline,
 }
 
 pub async fn run(config: Config, parent_context: Option<opentelemetry::Context>) -> Result<()> {
@@ -135,6 +132,10 @@ pub async fn run(config: Config, parent_context: Option<opentelemetry::Context>)
 
     // Load credential store for header injection
     let credentials = CredentialStore::load(&config.credentials)?;
+    // Prime any sanctum-backed credentials with an initial token fetch
+    // and spawn their background refresh tasks. Failure here aborts startup
+    // so we don't serve traffic with an unpopulated credential.
+    credentials.start_sanctum_refresh().await?;
 
     // Load GCP credentials (service accounts + user accounts)
     let gcp_credentials =
@@ -145,6 +146,7 @@ pub async fn run(config: Config, parent_context: Option<opentelemetry::Context>)
         };
 
     let idle_timeout = Duration::from_secs(config.proxy.idle_timeout_secs);
+    let limits = config.proxy.limits();
 
     // Create log directory if configured
     let log_dir = if let Some(ref dir) = config.proxy.log_dir {
@@ -154,11 +156,6 @@ pub async fn run(config: Config, parent_context: Option<opentelemetry::Context>)
     } else {
         None
     };
-
-    let llm_metrics = llm::LlmMetricsStore::default();
-
-    // Build transform pipeline from config
-    let transform_pipeline = transform::build_pipeline(&config.transforms);
 
     // Initialize Prometheus metrics
     let proxy_metrics = ProxyMetrics::new();
@@ -172,18 +169,22 @@ pub async fn run(config: Config, parent_context: Option<opentelemetry::Context>)
         credentials,
         gcp_credentials,
         idle_timeout,
+        limits,
         log_dir,
-        llm_metrics: llm_metrics.clone(),
         metrics: proxy_metrics.clone(),
-        transform_pipeline,
     });
 
-    // Spawn metrics server if configured
+    // Spawn observability services if configured
     if let Some(ref obs) = config.observability {
         if let Some(ref listen) = obs.metrics_listen {
             let (metrics_addr, _metrics_handle) =
-                metrics::spawn(listen, llm_metrics, proxy_metrics).await?;
+                metrics::spawn(listen, proxy_metrics.clone()).await?;
             info!(addr = %metrics_addr, "metrics server started");
+        }
+        if let Some(ref col_config) = obs.collector {
+            let (col_addr, _col_handle) =
+                collector::spawn(col_config, obs, proxy_metrics.clone()).await?;
+            info!(addr = %col_addr, "collector started");
         }
     }
 
@@ -192,6 +193,7 @@ pub async fn run(config: Config, parent_context: Option<opentelemetry::Context>)
         let rp = reverse::ReverseProxyConfig {
             listen: rp_config.listen.clone(),
             backend: rp_config.backend.clone(),
+            idle_timeout: Duration::from_secs(rp_config.idle_timeout_secs),
         };
         let (bound_addr, _rp_handle) = reverse::spawn(rp).await?;
         info!(addr = %bound_addr, backend = %rp_config.backend, "reverse proxy started");
@@ -209,6 +211,25 @@ pub async fn run(config: Config, parent_context: Option<opentelemetry::Context>)
     let listener = TcpListener::bind(&config.proxy.listen).await?;
     let listen_addr = listener.local_addr()?;
     info!(addr = %listen_addr, "listening for connections");
+
+    // Forward-proxy connection heartbeat. Tracks the unix-seconds
+    // timestamp of the last accepted connection on the main listener
+    // (workload → alice → upstream). A stalled workload can go silent
+    // mid-task, between one upstream response and its next request —
+    // alice sees zero connections for that whole window. Without a
+    // heartbeat, "no inbound for N seconds" is only visible by
+    // *absence* of log lines, which is hard to grep for and easy to
+    // confuse with "alice itself stopped logging." The background task
+    // below makes the gap a single emitted INFO line.
+    //
+    // Initialised to startup time so the first stretch with zero
+    // accepts (cold sandbox before the workload starts) doesn't read
+    // as an instant stall. The heartbeat only fires once silence
+    // crosses ACCEPT_HEARTBEAT_SECS, so a quiet startup is silent.
+    let last_accept_unix = Arc::new(AtomicU64::new(now_unix_secs()));
+    drop(tokio::spawn(spawn_accept_heartbeat(Arc::clone(
+        &last_accept_unix,
+    ))));
 
     // Server lifecycle span — covers the entire accept loop.
     // Uses .instrument() so the span is properly entered/exited around each
@@ -289,6 +310,13 @@ pub async fn run(config: Config, parent_context: Option<opentelemetry::Context>)
                 result = listener.accept() => {
                     match result {
                         Ok((stream, addr)) => {
+                            // Stamp accept time before any blocking
+                            // semaphore acquire — heartbeat tracks
+                            // "kernel handed us a connection," not
+                            // "we made it past the connection limit."
+                            // The two only diverge under a wedged limit
+                            // exhaustion, which is its own log line below.
+                            last_accept_unix.store(now_unix_secs(), Ordering::Relaxed);
                             // Acquire connection permit (blocks if at limit)
                             let permit = match connection_limit.clone().try_acquire_owned() {
                                 Ok(permit) => permit,
@@ -313,7 +341,7 @@ pub async fn run(config: Config, parent_context: Option<opentelemetry::Context>)
 
                             let state = Arc::clone(&state);
                             let span = info_span!("conn", %addr);
-                            tokio::spawn(
+                            drop(tokio::spawn(
                                 async move {
                                     // Permit is held for duration of connection
                                     let _permit = permit;
@@ -331,7 +359,7 @@ pub async fn run(config: Config, parent_context: Option<opentelemetry::Context>)
                                     }
                                 }
                                 .instrument(span),
-                            );
+                            ));
                         }
                         Err(e) => {
                             error!(error = %e, "accept error");
@@ -345,4 +373,59 @@ pub async fn run(config: Config, parent_context: Option<opentelemetry::Context>)
     }
     .instrument(server_span)
     .await
+}
+
+/// Threshold (seconds since the last accept) at which the heartbeat
+/// task starts emitting `proxy.idle` log lines. Tuned to land *before*
+/// the ~120s idle kill a sandbox supervisor typically applies, so the
+/// gap shows up in alice's logs while the stall is still live, not
+/// only in post-mortems.
+const ACCEPT_HEARTBEAT_SECS: u64 = 30;
+
+/// Re-emit cadence once silent. Past the threshold, log every
+/// `ACCEPT_HEARTBEAT_EVERY` seconds so a long wedge produces multiple
+/// timestamped lines for grep-friendly "when did the gap start /
+/// end" diagnosis.
+const ACCEPT_HEARTBEAT_EVERY: u64 = 30;
+
+fn now_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Periodic INFO line when the forward proxy hasn't accepted a
+/// connection for a while. Distinguishes "alice is idle (nothing's
+/// happening)" from "alice is wedged (we're listening but no one's
+/// calling)" without having to grep for the *absence* of `request.summary`.
+async fn spawn_accept_heartbeat(last_accept_unix: Arc<AtomicU64>) {
+    // Wake at half the emit cadence: catches threshold crossings
+    // promptly without paying for sub-second precision we don't need.
+    let mut tick = tokio::time::interval(Duration::from_secs(ACCEPT_HEARTBEAT_EVERY / 2));
+    let _ = tick.tick().await; // consume immediate first tick
+    let mut last_log_unix: u64 = 0;
+    loop {
+        let _ = tick.tick().await;
+        let now = now_unix_secs();
+        let last = last_accept_unix.load(Ordering::Relaxed);
+        let silent = now.saturating_sub(last);
+        if silent < ACCEPT_HEARTBEAT_SECS {
+            // Reset the rate-limiter so the next stretch of silence
+            // gets its first heartbeat immediately at threshold rather
+            // than waiting for the cadence to lap.
+            last_log_unix = 0;
+            continue;
+        }
+        let due = last_log_unix == 0 || now.saturating_sub(last_log_unix) >= ACCEPT_HEARTBEAT_EVERY;
+        if !due {
+            continue;
+        }
+        last_log_unix = now;
+        info!(
+            silent_for_secs = silent,
+            last_accept_unix = last,
+            "proxy.idle no inbound forward-proxy connection"
+        );
+    }
 }

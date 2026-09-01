@@ -58,7 +58,11 @@ impl CertificateAuthority {
         let ca_cert = ca_params.self_signed(&ca_key)?;
         let ca_cert_der = CertificateDer::from(ca_cert.der().to_vec());
 
-        let cache_ttl = Duration::from_secs((host_cert_validity_hours as u64 * 3600) - 300);
+        // Config validation guarantees host_cert_validity_hours > 0, so the
+        // subtraction can't underflow; saturating_sub is a belt-and-suspenders
+        // guard against a near-infinite TTL if that invariant is ever bypassed.
+        let cache_ttl =
+            Duration::from_secs((host_cert_validity_hours as u64 * 3600).saturating_sub(300));
         let cache = Cache::builder()
             .max_capacity(1000)
             .time_to_live(cache_ttl)

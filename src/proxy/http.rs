@@ -1,8 +1,6 @@
 use crate::config::Action;
-use crate::proxy::llm;
-use crate::proxy::request::{self, RequestOutcome};
+use crate::proxy::request::RequestOutcome;
 use crate::proxy::tls::{self, NegotiatedProtocol};
-use crate::proxy::transform::TransformResult;
 use crate::proxy::{h2 as h2_proxy, ProxyState};
 use anyhow::{anyhow, Context, Result};
 use http::{HeaderName, HeaderValue};
@@ -24,7 +22,7 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ProxyState>) -> Res
     // Read the initial HTTP request (should be CONNECT for HTTPS)
     let mut reader = BufReader::new(stream);
     let mut request_line = String::new();
-    reader.read_line(&mut request_line).await?;
+    let _ = reader.read_line(&mut request_line).await?;
 
     let parts: Vec<&str> = request_line.split_whitespace().collect();
     if parts.len() < 3 {
@@ -54,7 +52,7 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ProxyState>) -> Res
     let mut headers = Vec::new();
     loop {
         let mut line = String::new();
-        reader.read_line(&mut line).await?;
+        let _ = reader.read_line(&mut line).await?;
         if line == "\r\n" || line == "\n" {
             break;
         }
@@ -144,12 +142,51 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ProxyState>) -> Res
 
     // Connect to upstream - use resolved IP if available to avoid double resolution
     let upstream_tcp = if let Some(ref ips) = resolved_ips {
-        // Use first resolved IP (CIDR rules already checked it's allowed)
-        let ip = ips.first().ok_or_else(|| anyhow!("no resolved IPs"))?;
-        let addr = SocketAddr::new(*ip, port);
-        TcpStream::connect(addr)
-            .await
-            .with_context(|| format!("failed to connect to {} ({})", host, addr))?
+        // Try the resolved addresses in order: a host with both A and AAAA records
+        // may only be listening on one family, and resolver ordering is not stable
+        // across versions.
+        //
+        // Only addresses that reach this same verdict on their own are eligible.
+        // `evaluate_host` matches a CIDR rule when *any* resolved IP falls in it,
+        // so re-checking each address individually keeps a rebinding answer from
+        // smuggling an unvetted IP in as a fallback.
+        let candidates: Vec<SocketAddr> = ips
+            .iter()
+            .filter(|ip| {
+                let per_ip = state.policy.evaluate_host(&host, Some(&[**ip]));
+                per_ip.action == decision.action && per_ip.rule_index == decision.rule_index
+            })
+            .map(|ip| SocketAddr::new(*ip, port))
+            .collect();
+
+        let mut stream = None;
+        let mut last_err = None;
+        for addr in &candidates {
+            match TcpStream::connect(addr).await {
+                Ok(s) => {
+                    stream = Some(s);
+                    break;
+                }
+                Err(e) => {
+                    debug!(host = %host, %addr, error = %e, "upstream connect failed, trying next address");
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        match (stream, last_err) {
+            (Some(s), _) => s,
+            (None, Some(e)) => {
+                return Err(anyhow::Error::new(e)
+                    .context(format!("failed to connect to {} ({:?})", host, candidates)))
+            }
+            (None, None) => {
+                return Err(anyhow!(
+                    "no policy-approved addresses to connect to for {}",
+                    host
+                ))
+            }
+        }
     } else {
         // No CIDR rules - let the OS resolve
         let upstream_addr = format!("{}:{}", host, port);
@@ -206,12 +243,11 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<ProxyState>) -> Res
             let (upstream_read, upstream_write) = tokio::io::split(upstream_tls);
 
             // Need inspection if path checking required, credentials need to be injected,
-            // token redaction is configured, logging enabled, or transforms are configured
+            // token redaction is configured, or logging is enabled.
             let needs_inspection = decision.needs_path_check
-                || decision.has_redact_paths
+                || decision.requires_redact_inspection
                 || state.credentials.has_credentials_for_host(&host)
-                || state.log_dir.is_some()
-                || !state.transform_pipeline.is_empty();
+                || state.log_dir.is_some();
 
             if needs_inspection {
                 // Use HTTP/1.1 parsing to inspect requests
@@ -274,8 +310,22 @@ where
         Ok::<_, anyhow::Error>(())
     };
 
-    tokio::try_join!(client_to_upstream, upstream_to_client)?;
+    // First-done-wins: once one direction EOFs we drop the other half so its
+    // socket closes. With try_join the proxy waits for both peers to close,
+    // which under TLS MITM can be never — leaving FDs in CLOSE-WAIT.
+    tokio::select! {
+        res = client_to_upstream => res?,
+        res = upstream_to_client => res?,
+    }
     Ok(())
+}
+
+enum IdleAction {
+    ClientReady,
+    ClientClosed,
+    UpstreamClosed,
+    UpstreamUnsolicited,
+    IdleTimeout,
 }
 
 /// Proxy with HTTP request inspection for path-based policy.
@@ -303,24 +353,59 @@ where
     let mut upstream_write = upstream_write;
     let idle_timeout = state.idle_timeout;
 
-    // Process requests in a loop (HTTP/1.1 keep-alive)
+    // Process requests in a loop (HTTP/1.1 keep-alive).
+    //
+    // We watch the upstream during idle so we notice when it half-closes (e.g.
+    // CDN keep-alive timeout); otherwise the upstream FD lingers in CLOSE-WAIT
+    // until idle_timeout, leaking FDs under parallel load. fill_buf is cancel-
+    // safe and non-consuming, so it's safe to race against; read_http_headers
+    // is not, so we only call it after the race resolves to ClientReady.
     loop {
+        let action = tokio::select! {
+            biased;
+            res = client_reader.fill_buf() => match res {
+                Ok([]) => IdleAction::ClientClosed,
+                Ok(_) => IdleAction::ClientReady,
+                Err(_) => IdleAction::ClientClosed,
+            },
+            res = upstream_reader.fill_buf() => match res {
+                Ok([]) => IdleAction::UpstreamClosed,
+                Ok(_) => IdleAction::UpstreamUnsolicited,
+                Err(_) => IdleAction::UpstreamClosed,
+            },
+            _ = tokio::time::sleep(idle_timeout) => IdleAction::IdleTimeout,
+        };
+
+        match action {
+            IdleAction::ClientClosed => break,
+            IdleAction::IdleTimeout => {
+                debug!("connection idle timeout");
+                break;
+            }
+            IdleAction::UpstreamClosed => {
+                debug!("upstream closed during keep-alive idle");
+                break;
+            }
+            IdleAction::UpstreamUnsolicited => {
+                debug!("unsolicited upstream data during idle, closing keep-alive");
+                break;
+            }
+            IdleAction::ClientReady => {}
+        }
+
         let request_start = Instant::now();
 
-        // Read request headers from client with idle timeout
-        let request_headers =
-            match tokio::time::timeout(idle_timeout, read_http_headers(&mut client_reader)).await {
-                Ok(Ok(headers)) => headers,
-                Ok(Err(_)) => {
-                    // Client disconnected or sent invalid data - connection done
-                    break;
-                }
-                Err(_) => {
-                    // Idle timeout - close connection
-                    debug!("connection idle timeout");
-                    break;
-                }
-            };
+        // Client has data buffered; safe to read full request headers.
+        let request_headers = match read_http_headers(
+            &mut client_reader,
+            state.limits.max_header_bytes,
+            state.limits.max_header_count,
+        )
+        .await
+        {
+            Ok(headers) => headers,
+            Err(_) => break,
+        };
 
         if request_headers.is_empty() {
             // Client closed connection gracefully
@@ -354,9 +439,28 @@ where
         );
         let _request_guard = request_span.enter();
 
-        // Parse headers for body handling and connection state
-        let content_length = parse_content_length(&request_str);
-        let is_chunked = is_chunked_encoding(&request_str);
+        // Parse headers for body handling and connection state. alice is the
+        // authority on framing: reject ambiguous combinations (Content-Length
+        // + Transfer-Encoding, or duplicate/conflicting Content-Length) rather
+        // than forward them and open a request-smuggling desync window.
+        let (content_length, is_chunked) = match classify_request_framing(&request_str) {
+            RequestFraming::Length(n) => (Some(n), false),
+            RequestFraming::Chunked => (None, true),
+            RequestFraming::Invalid => {
+                warn!(
+                    host = %host,
+                    path = %path,
+                    "rejecting request with ambiguous framing (request-smuggling vector)"
+                );
+                // We cannot safely locate the body boundary, so we must close
+                // the connection rather than try to resync.
+                let response =
+                    "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                client_write.write_all(response.as_bytes()).await?;
+                client_write.flush().await?;
+                break;
+            }
+        };
         let client_wants_close = wants_connection_close(&request_str);
 
         // Evaluate policy (with resolved IPs for CIDR rules if available)
@@ -403,8 +507,8 @@ where
         }
 
         // Record span fields for allowed request (status will be updated after response)
-        request_span.record("alice.policy.action", "allow");
-        request_span.record("alice.policy.rule_index", decision.rule_index as i64);
+        let _ = request_span.record("alice.policy.action", "allow");
+        let _ = request_span.record("alice.policy.rule_index", decision.rule_index as i64);
         info!(host = %host, path = %path, method = %method, rule = decision.rule_index, "allowed");
 
         // Inject credentials if needed
@@ -416,37 +520,11 @@ where
 
         // Always buffer request body (needed for logging and credential inspection)
         let request_body = if let Some(len) = content_length {
-            read_body_fixed(&mut client_reader, len).await?
+            read_body_fixed(&mut client_reader, len, state.limits.max_body_bytes).await?
         } else if is_chunked {
-            read_body_chunked(&mut client_reader).await?
+            read_body_chunked(&mut client_reader, state.limits.max_body_bytes).await?
         } else {
             Vec::new()
-        };
-
-        // Run transform pipeline on /v1/messages requests
-        let (request_headers, request_body) = {
-            let mut body = request_body;
-            let original_len = body.len();
-            match request::apply_transforms(&state.transform_pipeline, &host, &path, &mut body) {
-                Some(TransformResult::Block { status, message }) => {
-                    let response = format!(
-                        "HTTP/1.1 {} Blocked\r\nContent-Length: {}\r\n\r\n{}",
-                        status,
-                        message.len(),
-                        message
-                    );
-                    client_write.write_all(response.as_bytes()).await?;
-                    client_write.flush().await?;
-                    if client_wants_close {
-                        break;
-                    }
-                    continue;
-                }
-                Some(TransformResult::Continue) if body.len() != original_len => {
-                    (rewrite_content_length(&request_headers, body.len()), body)
-                }
-                _ => (request_headers, body),
-            }
         };
 
         // GCP JWT re-signing: intercept token exchange POST bodies
@@ -468,6 +546,12 @@ where
                 (request_headers, request_body)
             };
 
+        // Strip hop-by-hop headers (Connection, Transfer-Encoding, Keep-Alive,
+        // Proxy-*, plus anything named in Connection) and emit a single
+        // Content-Length matching the body alice actually forwards. This makes
+        // alice the sole framing authority and closes the smuggling window.
+        let request_headers = sanitize_request_headers(&request_headers, request_body.len());
+
         // Forward request headers to upstream
         upstream_write.write_all(&request_headers).await?;
 
@@ -476,7 +560,12 @@ where
         upstream_write.flush().await?;
 
         // Read response headers from upstream
-        let response_headers = read_http_headers(&mut upstream_reader).await?;
+        let response_headers = read_http_headers(
+            &mut upstream_reader,
+            state.limits.max_header_bytes,
+            state.limits.max_header_count,
+        )
+        .await?;
         if response_headers.is_empty() {
             return Err(anyhow!("upstream closed connection unexpectedly"));
         }
@@ -493,18 +582,22 @@ where
         // Handle response body - buffer for redaction or GCP token interception, stream otherwise
         let needs_body_buffer =
             decision.redact_tokens || state.gcp_credentials.is_gcp_token_request(&host, &path);
-        let (response_headers, response_body) = if needs_body_buffer {
+        let (response_headers, response_body, response_body_bytes) = if needs_body_buffer {
             // Token redaction requires buffering the entire body to modify JSON
             let response_body = if let Some(len) = resp_content_length {
-                read_body_fixed(&mut upstream_reader, len).await?
+                read_body_fixed(&mut upstream_reader, len, state.limits.max_body_bytes).await?
             } else if resp_is_chunked {
-                read_body_chunked(&mut upstream_reader).await?
+                read_body_chunked(&mut upstream_reader, state.limits.max_body_bytes).await?
             } else {
                 Vec::new()
             };
 
             // Decompress gzip if needed for JSON parsing
-            let decompressed = decompress_gzip_if_needed(&response_headers, &response_body);
+            let decompressed = decompress_gzip_if_needed(
+                &response_headers,
+                &response_body,
+                state.limits.max_decompressed_bytes,
+            );
             let body_for_redaction = decompressed.as_deref().unwrap_or(&response_body);
 
             // Redact OAuth tokens
@@ -533,43 +626,39 @@ where
             client_write.write_all(&body).await?;
             client_write.flush().await?;
 
-            (headers, body)
+            let body_len = body.len();
+            (headers, body, body_len)
         } else {
             // Stream response through without buffering (for SSE, large responses, etc.)
             // Forward headers immediately
             client_write.write_all(&response_headers).await?;
             client_write.flush().await?;
 
-            // Create LLM metrics accumulator for /v1/messages SSE responses
-            let is_llm_sse = llm::is_messages_endpoint(&path)
-                && llm::is_sse_response(&String::from_utf8_lossy(&response_headers));
-            let mut llm_acc = llm::StreamingMetricsAccumulator::new();
+            // Only accumulate the body in memory when something will read
+            // it back — i.e. when we're going to write it to the log dir,
+            // or when this is a non-2xx response and `record_summary` needs
+            // an excerpt for the journal. Skipping otherwise avoids holding
+            // an entire `cargo install` crate (multi-MB) in memory per
+            // connection.
+            let capture = state.log_dir.is_some() || (400..600).contains(&response_status);
 
-            // Stream body, capturing for logging if enabled
-            let mut observer_fn = |chunk: &[u8]| llm_acc.process_chunk(chunk);
-            let response_body = if let Some(len) = resp_content_length {
-                stream_body_fixed(&mut upstream_reader, &mut client_write, len).await?
-            } else if resp_is_chunked {
-                stream_body_chunked(
+            let (response_body, response_body_bytes) = if let Some(len) = resp_content_length {
+                let (body, n) = stream_body_fixed(
                     &mut upstream_reader,
                     &mut client_write,
-                    if is_llm_sse {
-                        Some(&mut observer_fn as &mut (dyn FnMut(&[u8]) + Send))
-                    } else {
-                        None
-                    },
+                    len,
+                    capture,
+                    state.limits.max_body_bytes,
                 )
-                .await?
+                .await?;
+                (body, n as usize)
+            } else if resp_is_chunked {
+                stream_body_chunked(&mut upstream_reader, &mut client_write, capture).await?
             } else {
-                Vec::new()
+                (Vec::new(), 0)
             };
 
-            // Emit LLM metrics if we were tracking this stream
-            if is_llm_sse {
-                llm_acc.emit(&host, &path, Some(&state.llm_metrics));
-            }
-
-            (response_headers.clone(), response_body)
+            (response_headers.clone(), response_body, response_body_bytes)
         };
 
         // Record span, metrics, and log the exchange
@@ -581,7 +670,7 @@ where
             action: "allow",
             rule_index: decision.rule_index,
             request_bytes: request_headers.len() + request_body.len(),
-            response_bytes: response_headers.len() + response_body.len(),
+            response_bytes: response_headers.len() + response_body_bytes,
             start: request_start,
             client_addr: &client_addr,
             request_headers: &request_headers,
@@ -591,6 +680,7 @@ where
         };
         outcome.record_span(&request_span);
         outcome.record_metrics(&state.metrics);
+        outcome.record_summary();
         outcome.log_exchange(&state.log_dir).await;
 
         // Check if either side wants to close
@@ -604,12 +694,39 @@ where
 
 /// Read HTTP headers (up to and including the blank line).
 /// Returns the raw bytes including the final \r\n\r\n.
-async fn read_http_headers<R: AsyncBufReadExt + Unpin>(reader: &mut R) -> Result<Vec<u8>> {
+///
+/// Bounded by `max_bytes` (total header block size) and `max_count` (number of
+/// header lines) so a slow-loris-style stream of headers — or a single
+/// unterminated line — can't grow the buffer without limit. Each line is read
+/// through a `take` adapter so one giant line can't exhaust memory before the
+/// size check runs.
+async fn read_http_headers<R: AsyncBufReadExt + Unpin>(
+    reader: &mut R,
+    max_bytes: usize,
+    max_count: usize,
+) -> Result<Vec<u8>> {
     let mut headers = Vec::new();
+    let mut count = 0usize;
 
     loop {
+        if headers.len() >= max_bytes {
+            return Err(anyhow!(
+                "header block exceeds maximum size of {} bytes",
+                max_bytes
+            ));
+        }
+        if count > max_count {
+            return Err(anyhow!(
+                "header block exceeds maximum count of {} lines",
+                max_count
+            ));
+        }
+
+        // Bound the per-line read so an unterminated line can't grow without
+        // limit before the size check above fires on the next iteration.
+        let budget = (max_bytes - headers.len()) as u64 + 1;
         let mut line = String::new();
-        let n = reader.read_line(&mut line).await?;
+        let n = (&mut *reader).take(budget).read_line(&mut line).await?;
         if n == 0 {
             // EOF before headers complete
             return Ok(headers);
@@ -621,6 +738,8 @@ async fn read_http_headers<R: AsyncBufReadExt + Unpin>(reader: &mut R) -> Result
         if line == "\r\n" || line == "\n" {
             break;
         }
+
+        count += 1;
     }
 
     Ok(headers)
@@ -661,6 +780,149 @@ fn wants_connection_close(headers: &str) -> bool {
     false
 }
 
+/// How alice should frame the body of an incoming request, after rejecting
+/// ambiguous combinations that enable request smuggling / desync.
+#[derive(Debug, PartialEq, Eq)]
+enum RequestFraming {
+    /// Fixed-length body (0 = no body).
+    Length(u64),
+    /// Chunked transfer-encoding.
+    Chunked,
+    /// Ambiguous or conflicting framing — reject with 400 and close.
+    Invalid,
+}
+
+/// Classify request body framing, rejecting smuggling vectors:
+/// - `Content-Length` together with `Transfer-Encoding` (classic CL.TE/TE.CL desync)
+/// - more than one `Content-Length` header (duplicate / conflicting)
+/// - a `Content-Length` value that doesn't parse as a single integer
+///   (e.g. `Content-Length: 5, 6`)
+/// - a `Transfer-Encoding` that isn't `chunked` (we can only reframe chunked)
+fn classify_request_framing(headers: &str) -> RequestFraming {
+    let mut content_lengths: Vec<u64> = Vec::new();
+    let mut content_length_invalid = false;
+    let mut has_transfer_encoding = false;
+    let mut is_chunked = false;
+
+    // Skip the request line; only header lines carry framing.
+    for line in headers.lines().skip(1) {
+        if line.is_empty() {
+            break;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let name = name.trim().to_ascii_lowercase();
+        let value = value.trim();
+        if name == "content-length" {
+            match value.parse::<u64>() {
+                Ok(v) => content_lengths.push(v),
+                Err(_) => content_length_invalid = true,
+            }
+        } else if name == "transfer-encoding" {
+            has_transfer_encoding = true;
+            if value.to_ascii_lowercase().contains("chunked") {
+                is_chunked = true;
+            }
+        }
+    }
+
+    if content_length_invalid {
+        return RequestFraming::Invalid;
+    }
+    // Duplicate Content-Length headers (whether or not the values agree) are a
+    // smuggling vector; reject rather than guess which one upstream honors.
+    if content_lengths.len() > 1 {
+        return RequestFraming::Invalid;
+    }
+    // Content-Length and Transfer-Encoding together is the classic desync.
+    if has_transfer_encoding && !content_lengths.is_empty() {
+        return RequestFraming::Invalid;
+    }
+
+    if has_transfer_encoding {
+        if is_chunked {
+            RequestFraming::Chunked
+        } else {
+            // A transfer-coding we can't dechunk and reframe.
+            RequestFraming::Invalid
+        }
+    } else {
+        RequestFraming::Length(content_lengths.first().copied().unwrap_or(0))
+    }
+}
+
+/// True for hop-by-hop headers that a proxy must not forward end-to-end.
+/// Covers the named set plus the `Proxy-*` family; callers also drop anything
+/// listed in the request's own `Connection` header.
+pub(crate) fn is_hop_by_hop(name_lower: &str) -> bool {
+    matches!(
+        name_lower,
+        "connection" | "keep-alive" | "transfer-encoding" | "te" | "trailer" | "upgrade"
+    ) || name_lower.starts_with("proxy-")
+}
+
+/// Strip hop-by-hop headers and rewrite framing so alice is the sole authority
+/// on the request it forwards. Removes Connection, Keep-Alive, Transfer-Encoding,
+/// TE, Trailer, Upgrade, Proxy-*, any header named in the Connection field, and
+/// all Content-Length headers, then sets a single Content-Length matching the
+/// body alice will actually send (omitted when there is no body).
+fn sanitize_request_headers(headers: &[u8], body_len: usize) -> Vec<u8> {
+    let headers_str = String::from_utf8_lossy(headers);
+
+    // Build the connection-token denylist first: every token named in a
+    // `Connection` header is itself hop-by-hop for this message.
+    let mut connection_tokens: Vec<String> = Vec::new();
+    for line in headers_str.lines().skip(1) {
+        if line.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            if name.trim().eq_ignore_ascii_case("connection") {
+                for tok in value.split(',') {
+                    let tok = tok.trim().to_ascii_lowercase();
+                    if !tok.is_empty() {
+                        connection_tokens.push(tok);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut result = Vec::new();
+
+    // Request line is forwarded unchanged.
+    let request_line = headers_str.lines().next().unwrap_or("");
+    result.extend_from_slice(request_line.as_bytes());
+    result.extend_from_slice(b"\r\n");
+
+    for line in headers_str.lines().skip(1) {
+        if line.is_empty() {
+            break;
+        }
+        let Some((name, _)) = line.split_once(':') else {
+            // Drop malformed header lines rather than forward them verbatim.
+            continue;
+        };
+        let lower = name.trim().to_ascii_lowercase();
+        if lower == "content-length" || is_hop_by_hop(&lower) || connection_tokens.contains(&lower)
+        {
+            continue;
+        }
+        result.extend_from_slice(line.as_bytes());
+        result.extend_from_slice(b"\r\n");
+    }
+
+    if body_len > 0 {
+        result.extend_from_slice(b"Content-Length: ");
+        result.extend_from_slice(body_len.to_string().as_bytes());
+        result.extend_from_slice(b"\r\n");
+    }
+
+    result.extend_from_slice(b"\r\n");
+    result
+}
+
 /// Drain (discard) a fixed-length body
 async fn drain_body_fixed<R: AsyncReadExt + Unpin>(reader: &mut R, length: u64) -> Result<()> {
     let mut remaining = length;
@@ -682,7 +944,7 @@ async fn drain_body_fixed<R: AsyncReadExt + Unpin>(reader: &mut R, length: u64) 
 async fn drain_body_chunked<R: AsyncBufReadExt + Unpin>(reader: &mut R) -> Result<()> {
     loop {
         let mut size_line = String::new();
-        reader.read_line(&mut size_line).await?;
+        let _ = reader.read_line(&mut size_line).await?;
 
         let size_str = size_line.trim();
         let size_hex = size_str.split(';').next().unwrap_or(size_str);
@@ -693,7 +955,7 @@ async fn drain_body_chunked<R: AsyncBufReadExt + Unpin>(reader: &mut R) -> Resul
             // Read trailing CRLF
             loop {
                 let mut trailer_line = String::new();
-                reader.read_line(&mut trailer_line).await?;
+                let _ = reader.read_line(&mut trailer_line).await?;
                 if trailer_line == "\r\n" || trailer_line == "\n" {
                     break;
                 }
@@ -715,14 +977,28 @@ async fn drain_body_chunked<R: AsyncBufReadExt + Unpin>(reader: &mut R) -> Resul
 
         // Drain CRLF
         let mut crlf = [0u8; 2];
-        reader.read_exact(&mut crlf).await?;
+        let _ = reader.read_exact(&mut crlf).await?;
     }
 
     Ok(())
 }
 
-/// Read a fixed-length body into a buffer (for logging)
-async fn read_body_fixed<R: AsyncReadExt + Unpin>(reader: &mut R, length: u64) -> Result<Vec<u8>> {
+/// Read a fixed-length body into a buffer (for logging).
+///
+/// A claimed `length` above `max_bytes` is rejected up front so a forged
+/// `Content-Length` can't trigger a huge eager allocation.
+async fn read_body_fixed<R: AsyncReadExt + Unpin>(
+    reader: &mut R,
+    length: u64,
+    max_bytes: u64,
+) -> Result<Vec<u8>> {
+    if length > max_bytes {
+        return Err(anyhow!(
+            "body length {} exceeds maximum of {} bytes",
+            length,
+            max_bytes
+        ));
+    }
     let mut body = Vec::with_capacity(length as usize);
     let mut remaining = length;
     let mut buf = [0u8; 8192];
@@ -740,26 +1016,39 @@ async fn read_body_fixed<R: AsyncReadExt + Unpin>(reader: &mut R, length: u64) -
     Ok(body)
 }
 
-/// Read a chunked body into a buffer (for logging)
-/// Returns the decoded body content (without chunk framing)
-async fn read_body_chunked<R: AsyncBufReadExt + Unpin>(reader: &mut R) -> Result<Vec<u8>> {
+/// Read a chunked body into a buffer (for logging).
+/// Returns the decoded body content (without chunk framing).
+///
+/// Accumulation is capped at `max_bytes` so a chunked stream can't grow the
+/// buffer without limit.
+async fn read_body_chunked<R: AsyncBufReadExt + Unpin>(
+    reader: &mut R,
+    max_bytes: u64,
+) -> Result<Vec<u8>> {
     let mut body = Vec::new();
 
     loop {
         // Read chunk size line
         let mut size_line = String::new();
-        reader.read_line(&mut size_line).await?;
+        let _ = reader.read_line(&mut size_line).await?;
 
         let size_str = size_line.trim();
         let size_hex = size_str.split(';').next().unwrap_or(size_str);
         let chunk_size = usize::from_str_radix(size_hex, 16)
             .with_context(|| format!("invalid chunk size: {}", size_line.trim()))?;
 
+        if body.len() as u64 + chunk_size as u64 > max_bytes {
+            return Err(anyhow!(
+                "chunked body exceeds maximum of {} bytes",
+                max_bytes
+            ));
+        }
+
         if chunk_size == 0 {
             // Terminal chunk - read trailing headers/CRLF
             loop {
                 let mut trailer_line = String::new();
-                reader.read_line(&mut trailer_line).await?;
+                let _ = reader.read_line(&mut trailer_line).await?;
                 if trailer_line == "\r\n" || trailer_line == "\n" {
                     break;
                 }
@@ -782,20 +1071,35 @@ async fn read_body_chunked<R: AsyncBufReadExt + Unpin>(reader: &mut R) -> Result
 
         // Read chunk-ending CRLF
         let mut crlf = [0u8; 2];
-        reader.read_exact(&mut crlf).await?;
+        let _ = reader.read_exact(&mut crlf).await?;
     }
 
     Ok(body)
 }
 
 /// Stream a fixed-length body from reader to writer.
-/// Returns the captured body for logging.
-async fn stream_body_fixed<R, W>(reader: &mut R, writer: &mut W, length: u64) -> Result<Vec<u8>>
+/// Returns `(captured_body, bytes_streamed)`. When `capture` is false the
+/// returned Vec is empty and no per-chunk allocation happens — important
+/// for large downloads (e.g. cargo crates) when no log_dir is configured.
+async fn stream_body_fixed<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    length: u64,
+    capture: bool,
+    max_capture_bytes: u64,
+) -> Result<(Vec<u8>, u64)>
 where
     R: AsyncReadExt + Unpin,
     W: AsyncWriteExt + Unpin,
 {
-    let mut body = Vec::with_capacity(length as usize);
+    // Cap the capture pre-allocation at `max_capture_bytes` so a forged
+    // `Content-Length` can't trigger a huge eager allocation. The body is
+    // still streamed through in full regardless of the claimed length.
+    let mut body = if capture {
+        Vec::with_capacity(std::cmp::min(length, max_capture_bytes) as usize)
+    } else {
+        Vec::new()
+    };
     let mut remaining = length;
     let mut buf = vec![0u8; 65536];
 
@@ -805,49 +1109,46 @@ where
         if n == 0 {
             return Err(anyhow!("unexpected EOF reading body"));
         }
-        // Capture for logging
-        body.extend_from_slice(&buf[..n]);
-        // Forward to client immediately
+        if capture {
+            body.extend_from_slice(&buf[..n]);
+        }
         writer.write_all(&buf[..n]).await?;
         remaining -= n as u64;
     }
 
-    Ok(body)
+    Ok((body, length))
 }
 
 /// Stream a chunked body from reader to writer, flushing after each chunk.
-/// Returns the captured decoded body content (without chunk framing).
-/// If `observer` is provided, each decoded chunk is also fed to it (for incremental SSE parsing).
-#[allow(clippy::type_complexity)]
+/// Returns `(captured_decoded_body, decoded_bytes)`. The Vec is empty if
+/// `capture` is false.
 async fn stream_body_chunked<R, W>(
     reader: &mut R,
     writer: &mut W,
-    mut observer: Option<&mut (dyn FnMut(&[u8]) + Send)>,
-) -> Result<Vec<u8>>
+    capture: bool,
+) -> Result<(Vec<u8>, usize)>
 where
     R: AsyncBufReadExt + Unpin,
     W: AsyncWriteExt + Unpin,
 {
     let mut body = Vec::new();
+    let mut total: usize = 0;
 
     loop {
-        // Read chunk size line
         let mut size_line = String::new();
-        reader.read_line(&mut size_line).await?;
+        let _ = reader.read_line(&mut size_line).await?;
 
         let size_str = size_line.trim();
         let size_hex = size_str.split(';').next().unwrap_or(size_str);
         let chunk_size = usize::from_str_radix(size_hex, 16)
             .with_context(|| format!("invalid chunk size: {}", size_line.trim()))?;
 
-        // Forward chunk size line to client
         writer.write_all(size_line.as_bytes()).await?;
 
         if chunk_size == 0 {
-            // Terminal chunk - read and forward trailing headers/CRLF
             loop {
                 let mut trailer_line = String::new();
-                reader.read_line(&mut trailer_line).await?;
+                let _ = reader.read_line(&mut trailer_line).await?;
                 writer.write_all(trailer_line.as_bytes()).await?;
                 if trailer_line == "\r\n" || trailer_line == "\n" {
                     break;
@@ -857,7 +1158,6 @@ where
             break;
         }
 
-        // Read and forward chunk data
         let mut remaining = chunk_size;
         let mut buf = vec![0u8; 65536];
         while remaining > 0 {
@@ -866,27 +1166,23 @@ where
             if n == 0 {
                 return Err(anyhow!("unexpected EOF in chunk"));
             }
-            // Capture decoded body for logging
-            body.extend_from_slice(&buf[..n]);
-            // Feed to observer (e.g., LLM metrics accumulator)
-            if let Some(ref mut obs) = observer {
-                obs(&buf[..n]);
+            if capture {
+                body.extend_from_slice(&buf[..n]);
             }
-            // Forward to client
             writer.write_all(&buf[..n]).await?;
             remaining -= n;
+            total += n;
         }
 
-        // Read and forward chunk-ending CRLF
         let mut crlf = [0u8; 2];
-        reader.read_exact(&mut crlf).await?;
+        let _ = reader.read_exact(&mut crlf).await?;
         writer.write_all(&crlf).await?;
 
-        // Flush after each chunk to ensure SSE events reach client immediately
+        // Flush after each chunk so SSE events reach the client immediately.
         writer.flush().await?;
     }
 
-    Ok(body)
+    Ok((body, total))
 }
 
 /// Parse HTTP response status code from response headers
@@ -934,7 +1230,7 @@ fn rewrite_content_length(headers: &[u8], new_length: usize) -> Vec<u8> {
 /// Check if a response is gzip-encoded and decompress if so.
 /// Returns `Some(decompressed)` if the response was gzip and decompression succeeded,
 /// or `None` if the response is not gzip or decompression failed.
-fn decompress_gzip_if_needed(headers: &[u8], body: &[u8]) -> Option<Vec<u8>> {
+fn decompress_gzip_if_needed(headers: &[u8], body: &[u8], max_bytes: u64) -> Option<Vec<u8>> {
     let headers_str = String::from_utf8_lossy(headers);
     let is_gzip = headers_str
         .lines()
@@ -947,9 +1243,18 @@ fn decompress_gzip_if_needed(headers: &[u8], body: &[u8]) -> Option<Vec<u8>> {
     use flate2::read::GzDecoder;
     use std::io::Read;
 
-    let mut decoder = GzDecoder::new(body);
+    // Bound the decompressed output at `max_bytes` to defuse decompression
+    // bombs: read at most one byte past the cap, then reject if we hit it.
+    let decoder = GzDecoder::new(body);
     let mut decompressed = Vec::new();
-    match decoder.read_to_end(&mut decompressed) {
+    match decoder.take(max_bytes + 1).read_to_end(&mut decompressed) {
+        Ok(_) if decompressed.len() as u64 > max_bytes => {
+            tracing::warn!(
+                max = max_bytes,
+                "gzip response exceeds decompression limit, skipping redaction"
+            );
+            None
+        }
         Ok(_) => {
             tracing::debug!(
                 original_len = body.len(),
@@ -1082,7 +1387,11 @@ fn inject_credentials_h1(request_buf: &[u8], host: &str, state: &ProxyState) -> 
 
 fn parse_host_port(uri: &str) -> Result<(String, u16)> {
     if let Some((host, port_str)) = uri.rsplit_once(':') {
-        let port = port_str.parse().unwrap_or(443);
+        // Surface a malformed authority rather than silently defaulting, which
+        // would mask a bad CONNECT target (e.g. "host:notaport").
+        let port = port_str
+            .parse()
+            .with_context(|| format!("invalid port in authority: {uri}"))?;
         Ok((host.to_string(), port))
     } else {
         Ok((uri.to_string(), 443))
@@ -1091,14 +1400,17 @@ fn parse_host_port(uri: &str) -> Result<(String, u16)> {
 
 fn check_basic_auth(encoded: &str, expected_user: &str, expected_pass: &str) -> bool {
     use base64::prelude::*;
-    if let Ok(decoded) = BASE64_STANDARD.decode(encoded) {
-        if let Ok(creds) = String::from_utf8(decoded) {
-            if let Some((user, pass)) = creds.split_once(':') {
-                return user == expected_user && pass == expected_pass;
-            }
-        }
-    }
-    false
+    use subtle::ConstantTimeEq;
+
+    let Ok(decoded) = BASE64_STANDARD.decode(encoded) else {
+        return false;
+    };
+    // Compare the decoded `user:pass` bytes (not the base64 text) against the
+    // expected credential in constant time, so a wrong guess can't be refined
+    // byte-by-byte from response timing. The length difference is allowed to
+    // short-circuit — only the credential's length, not its contents, leaks.
+    let expected = format!("{expected_user}:{expected_pass}");
+    decoded.ct_eq(expected.as_bytes()).into()
 }
 
 #[cfg(test)]
@@ -1112,7 +1424,7 @@ mod tests {
         let data = b"GET /path HTTP/1.1\r\nHost: example.com\r\n\r\n";
         let mut reader = BufReader::new(Cursor::new(data.to_vec()));
 
-        let headers = read_http_headers(&mut reader).await.unwrap();
+        let headers = read_http_headers(&mut reader, 65536, 200).await.unwrap();
         let headers_str = String::from_utf8_lossy(&headers);
 
         assert!(headers_str.contains("GET /path HTTP/1.1"));
@@ -1126,9 +1438,87 @@ mod tests {
         let data = b"GET /path HTTP/1.1\r\n";
         let mut reader = BufReader::new(Cursor::new(data.to_vec()));
 
-        let headers = read_http_headers(&mut reader).await.unwrap();
+        let headers = read_http_headers(&mut reader, 65536, 200).await.unwrap();
         // Should return partial data on EOF
         assert!(!headers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_read_http_headers_size_cap() {
+        // A header block larger than the cap is rejected rather than buffered.
+        let mut data = b"GET / HTTP/1.1\r\n".to_vec();
+        for i in 0..1000 {
+            data.extend_from_slice(format!("X-Pad-{i}: aaaaaaaaaaaaaaaaaaaa\r\n").as_bytes());
+        }
+        data.extend_from_slice(b"\r\n");
+        let mut reader = BufReader::new(Cursor::new(data));
+
+        let err = read_http_headers(&mut reader, 1024, 200).await.unwrap_err();
+        assert!(err.to_string().contains("maximum size"));
+    }
+
+    #[tokio::test]
+    async fn test_read_http_headers_count_cap() {
+        // Many small header lines trip the count cap before the size cap.
+        let mut data = b"GET / HTTP/1.1\r\n".to_vec();
+        for i in 0..100 {
+            data.extend_from_slice(format!("X-{i}: y\r\n").as_bytes());
+        }
+        data.extend_from_slice(b"\r\n");
+        let mut reader = BufReader::new(Cursor::new(data));
+
+        let err = read_http_headers(&mut reader, 1 << 20, 10)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("maximum count"));
+    }
+
+    #[tokio::test]
+    async fn test_read_body_fixed_rejects_oversized() {
+        // A claimed Content-Length above the cap is rejected up front — no
+        // eager allocation of the claimed size.
+        let mut reader = BufReader::new(Cursor::new(Vec::new()));
+        let err = read_body_fixed(&mut reader, 10_000_000_000, 1024)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("exceeds maximum"));
+    }
+
+    #[tokio::test]
+    async fn test_read_body_fixed_within_cap() {
+        let data = b"hello world".to_vec();
+        let len = data.len() as u64;
+        let mut reader = BufReader::new(Cursor::new(data));
+        let body = read_body_fixed(&mut reader, len, 1024).await.unwrap();
+        assert_eq!(body, b"hello world");
+    }
+
+    #[tokio::test]
+    async fn test_read_body_chunked_rejects_oversized() {
+        // Two 8-byte chunks exceed a 10-byte cap.
+        let data = b"8\r\nAAAAAAAA\r\n8\r\nBBBBBBBB\r\n0\r\n\r\n".to_vec();
+        let mut reader = BufReader::new(Cursor::new(data));
+        let err = read_body_chunked(&mut reader, 10).await.unwrap_err();
+        assert!(err.to_string().contains("exceeds maximum"));
+    }
+
+    #[test]
+    fn test_decompress_gzip_rejects_bomb() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        // 1 MiB of zeros compresses tiny but decompresses past a small cap.
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&vec![0u8; 1024 * 1024]).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let headers = b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\n\r\n";
+        // Cap below the decompressed size -> rejected (returns None).
+        assert!(decompress_gzip_if_needed(headers, &compressed, 4096).is_none());
+        // Cap above the decompressed size -> decompresses fine.
+        let out = decompress_gzip_if_needed(headers, &compressed, 8 * 1024 * 1024).unwrap();
+        assert_eq!(out.len(), 1024 * 1024);
     }
 
     #[test]
@@ -1153,8 +1543,133 @@ mod tests {
             "alice",
             "secret123"
         ));
+        // Wrong password
         assert!(!check_basic_auth("YWxpY2U6c2VjcmV0MTIz", "alice", "wrong"));
+        // Wrong user
+        assert!(!check_basic_auth(
+            "YWxpY2U6c2VjcmV0MTIz",
+            "bob",
+            "secret123"
+        ));
+        // Correct prefix but truncated password (length differs)
+        assert!(!check_basic_auth(
+            "YWxpY2U6c2VjcmV0MTIz",
+            "alice",
+            "secret12"
+        ));
+        // Malformed base64
         assert!(!check_basic_auth("invalid-base64!!!", "alice", "secret"));
+        // Password containing a colon: the full decoded `user:pass` must match,
+        // so the split is on the credential as a whole, not the first colon.
+        // "alice:sec:ret" base64 encoded
+        assert!(check_basic_auth("YWxpY2U6c2VjOnJldA==", "alice", "sec:ret"));
+    }
+
+    #[test]
+    fn test_classify_request_framing_simple() {
+        assert_eq!(
+            classify_request_framing("POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\n"),
+            RequestFraming::Length(5)
+        );
+        assert_eq!(
+            classify_request_framing("GET / HTTP/1.1\r\nHost: x\r\n\r\n"),
+            RequestFraming::Length(0)
+        );
+        assert_eq!(
+            classify_request_framing("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"),
+            RequestFraming::Chunked
+        );
+    }
+
+    #[test]
+    fn test_classify_request_framing_rejects_cl_and_te() {
+        // The classic CL.TE / TE.CL smuggling vector.
+        let headers = "POST / HTTP/1.1\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n";
+        assert_eq!(classify_request_framing(headers), RequestFraming::Invalid);
+    }
+
+    #[test]
+    fn test_classify_request_framing_rejects_duplicate_cl() {
+        // Conflicting duplicate Content-Length.
+        let conflicting = "POST / HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\n";
+        assert_eq!(
+            classify_request_framing(conflicting),
+            RequestFraming::Invalid
+        );
+        // Even identical duplicates are rejected — a well-formed client sends one.
+        let identical = "POST / HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\n";
+        assert_eq!(classify_request_framing(identical), RequestFraming::Invalid);
+    }
+
+    #[test]
+    fn test_classify_request_framing_rejects_bad_cl() {
+        // A comma-listed / unparseable Content-Length value.
+        let headers = "POST / HTTP/1.1\r\nContent-Length: 5, 6\r\n\r\n";
+        assert_eq!(classify_request_framing(headers), RequestFraming::Invalid);
+        // A non-chunked transfer-coding we can't reframe.
+        let te = "POST / HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n";
+        assert_eq!(classify_request_framing(te), RequestFraming::Invalid);
+    }
+
+    #[test]
+    fn test_is_hop_by_hop() {
+        for h in [
+            "connection",
+            "keep-alive",
+            "transfer-encoding",
+            "te",
+            "trailer",
+            "upgrade",
+            "proxy-authorization",
+            "proxy-connection",
+        ] {
+            assert!(is_hop_by_hop(h), "{h} should be hop-by-hop");
+        }
+        assert!(!is_hop_by_hop("content-type"));
+        assert!(!is_hop_by_hop("authorization"));
+        assert!(!is_hop_by_hop("host"));
+    }
+
+    #[test]
+    fn test_sanitize_request_headers_strips_hop_by_hop() {
+        let headers = b"POST /x HTTP/1.1\r\n\
+            Host: example.com\r\n\
+            Connection: keep-alive, x-custom\r\n\
+            Keep-Alive: timeout=5\r\n\
+            Transfer-Encoding: chunked\r\n\
+            Proxy-Authorization: Basic abc\r\n\
+            X-Custom: secret\r\n\
+            Content-Length: 999\r\n\
+            Content-Type: application/json\r\n\
+            \r\n";
+        let out = sanitize_request_headers(headers, 11);
+        let out = String::from_utf8(out).unwrap();
+
+        // Request line and end-to-end headers survive.
+        assert!(out.starts_with("POST /x HTTP/1.1\r\n"));
+        assert!(out.contains("Host: example.com\r\n"));
+        assert!(out.contains("Content-Type: application/json\r\n"));
+
+        // Hop-by-hop headers are gone.
+        assert!(!out.to_lowercase().contains("connection:"));
+        assert!(!out.to_lowercase().contains("keep-alive:"));
+        assert!(!out.to_lowercase().contains("transfer-encoding:"));
+        assert!(!out.to_lowercase().contains("proxy-authorization:"));
+        // The header named in Connection is also dropped.
+        assert!(!out.contains("X-Custom: secret"));
+
+        // alice sets a single Content-Length matching the forwarded body.
+        assert_eq!(out.matches("Content-Length:").count(), 1);
+        assert!(out.contains("Content-Length: 11\r\n"));
+        assert!(out.ends_with("\r\n\r\n"));
+    }
+
+    #[test]
+    fn test_sanitize_request_headers_no_body_omits_content_length() {
+        let headers = b"GET / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 0\r\n\r\n";
+        let out = String::from_utf8(sanitize_request_headers(headers, 0)).unwrap();
+        assert!(!out.to_lowercase().contains("content-length:"));
+        assert!(out.contains("Host: example.com\r\n"));
     }
 
     #[test]
@@ -1174,5 +1689,7 @@ mod tests {
             parse_host_port("api.github.com:443").unwrap(),
             ("api.github.com".to_string(), 443)
         );
+        // Malformed port is surfaced as an error, not silently defaulted
+        assert!(parse_host_port("example.com:notaport").is_err());
     }
 }

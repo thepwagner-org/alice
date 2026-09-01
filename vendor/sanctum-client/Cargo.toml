@@ -1,0 +1,28 @@
+[package]
+name = "sanctum-client"
+version = "0.0.0-dev"
+edition = "2021"
+description = "Generated gRPC bindings for the sanctum credential broker's wire API"
+license = "MIT"
+
+[dependencies]
+tonic = "0.14"
+tonic-prost = "0.14"
+prost = "0.14"
+prost-types = "0.14"
+
+[build-dependencies]
+tonic-build = "0.14"
+tonic-prost-build = "0.14"
+
+# The crate is generated code plus a re-export shim, so the strict lints the
+# consuming crates set (print_stdout, panic, …) have nothing here to catch —
+# and `build.rs` legitimately writes cargo directives to stdout.
+[lints.rust]
+unsafe_code = "forbid"
+unused_results = "warn"
+
+[lints.clippy]
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"

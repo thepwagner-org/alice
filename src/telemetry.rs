@@ -1,7 +1,6 @@
 //! OpenTelemetry telemetry initialization.
 //!
-//! Adapted from nix-jail's telemetry setup. Provides optional OTLP export
-//! with graceful shutdown via TracingGuard.
+//! Provides optional OTLP export with graceful shutdown via TracingGuard.
 
 use opentelemetry::propagation::TextMapPropagator;
 use opentelemetry::trace::TracerProvider as _;
@@ -26,6 +25,10 @@ pub fn version() -> &'static str {
 pub struct TracingGuard {
     provider: Option<SdkTracerProvider>,
     parent_context: Option<opentelemetry::Context>,
+    /// Keeps the non-blocking log writer's worker thread alive. Dropping it
+    /// flushes whatever is still queued, so it must outlive every `tracing`
+    /// call — i.e. live exactly as long as this guard.
+    _log_writer: tracing_appender::non_blocking::WorkerGuard,
 }
 
 impl TracingGuard {
@@ -48,14 +51,16 @@ impl std::fmt::Debug for TracingGuard {
         f.debug_struct("TracingGuard")
             .field("provider", &self.provider.is_some())
             .field("parent_context", &self.parent_context.is_some())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
 impl Drop for TracingGuard {
+    // Tracing is being torn down here, so `tracing::*` would either no-op or
+    // recurse. Direct stderr is the only safe channel for shutdown diagnostics.
+    #[allow(clippy::print_stderr)]
     fn drop(&mut self) {
         if let Some(provider) = self.provider.take() {
-            // Force flush any pending spans before shutdown
             eprintln!("[telemetry] flushing spans...");
             if let Err(e) = provider.force_flush() {
                 eprintln!("[telemetry] flush error: {e}");
@@ -97,8 +102,23 @@ pub fn init_tracing(json: bool, otlp_endpoint: Option<&str>) -> TracingGuard {
     };
 
     // Build the subscriber with optional OTel layer
+    // Write logs through a non-blocking appender rather than straight to
+    // `std::io::stderr`.
+    //
+    // alice logs one line per allowed request, and `std::io::stderr()` is
+    // globally locked with a blocking `write_all`. When whatever is reading
+    // the other end of the pipe stops draining it (as happens when a
+    // supervising process parks on a full log channel), that write blocks
+    // *while holding the stderr lock*, every task that logs piles up behind
+    // it, and the proxy stops serving traffic entirely. A stalled log reader
+    // must never be able to take the proxy down with it.
+    //
+    // `non_blocking` moves the writes to a dedicated thread and drops lines
+    // when its queue is full, which is the right trade for request logs.
+    let (log_writer, log_writer_guard) = tracing_appender::non_blocking(std::io::stderr());
+
     if json {
-        let fmt_layer = fmt::layer().json().with_writer(std::io::stderr);
+        let fmt_layer = fmt::layer().json().with_writer(log_writer);
         let otel_layer = provider.as_ref().map(|p| {
             tracing_opentelemetry::layer().with_tracer(p.tracer(SERVICE_NAME.to_string()))
         });
@@ -109,7 +129,7 @@ pub fn init_tracing(json: bool, otlp_endpoint: Option<&str>) -> TracingGuard {
             .with(otel_layer)
             .init();
     } else {
-        let fmt_layer = fmt::layer().with_writer(std::io::stderr);
+        let fmt_layer = fmt::layer().with_writer(log_writer);
         let otel_layer = provider.as_ref().map(|p| {
             tracing_opentelemetry::layer().with_tracer(p.tracer(SERVICE_NAME.to_string()))
         });
@@ -122,7 +142,7 @@ pub fn init_tracing(json: bool, otlp_endpoint: Option<&str>) -> TracingGuard {
     }
 
     // Extract parent trace context from environment variables (W3C Trace Context).
-    // This allows alice's spans to link to the nix-jail job's trace when spawned
+    // This allows alice's spans to link to the supervising job's trace when spawned
     // with TRACEPARENT/TRACESTATE env vars.
     let parent_context = extract_parent_context_from_env();
 
@@ -141,6 +161,7 @@ pub fn init_tracing(json: bool, otlp_endpoint: Option<&str>) -> TracingGuard {
     TracingGuard {
         provider,
         parent_context,
+        _log_writer: log_writer_guard,
     }
 }
 

@@ -1,0 +1,66 @@
+// The one copy of the sanctum wire schema. The broker and every consumer
+// take their generated bindings from this crate via a cargo `path` dep —
+// don't copy this file into another project.
+
+syntax = "proto3";
+
+package sanctum;
+
+import "google/protobuf/timestamp.proto";
+
+// Sanctum holds long-lived credentials and hands out fresh access tokens.
+// One service per host, many credentials per service. Localhost-only by trust.
+service Sanctum {
+  // Returns the currently cached access token for the named credential.
+  // The broker keeps each credential fresh in the background (refresh when
+  // TTL drops under threshold); most callers don't need to think about
+  // expiry. Returns NotFound if the name doesn't match a credential in the
+  // vault, InvalidArgument if the name fails validation.
+  rpc GetAccessToken(GetAccessTokenRequest) returns (AccessToken);
+
+  // Bypass the cache and force a refresh against the credential's upstream
+  // (e.g. platform.claude.com/v1/oauth/token for an anthropic-oauth
+  // credential). For consumers that hit a 401 from upstream and want to
+  // nudge the broker before retrying.
+  rpc ForceRefresh(ForceRefreshRequest) returns (AccessToken);
+
+  // Seed a vault slot from a raw credential source file. The broker parses,
+  // encrypts with its key, and persists the credential — the caller never
+  // touches the key. Replaces an existing slot of the same name.
+  rpc ImportCredential(ImportCredentialRequest) returns (ImportCredentialResponse);
+}
+
+message GetAccessTokenRequest {
+  // Credential name, matches a `<name>.json` file in the broker's state dir.
+  string name = 1;
+}
+
+message ForceRefreshRequest {
+  string name = 1;
+}
+
+message ImportCredentialRequest {
+  // Slot name — must match [a-zA-Z0-9][a-zA-Z0-9_-]*.
+  string name = 1;
+  // Credential kind. Currently only "anthropic-oauth" is supported.
+  string kind = 2;
+  // Raw content of the source credential file (e.g. ~/.claude/.credentials.json).
+  bytes source = 3;
+}
+
+message ImportCredentialResponse {
+  string name = 1;
+  string kind = 2;
+  // When the imported access token expires.
+  google.protobuf.Timestamp access_expires_at = 3;
+}
+
+message AccessToken {
+  // The access token. Use directly in the consumer's chosen header (e.g.
+  // `Authorization: Bearer <token>` for anthropic-oauth).
+  string access_token = 1;
+
+  // When this token expires upstream. Informational; the broker is
+  // responsible for refreshing before this point.
+  google.protobuf.Timestamp expires_at = 2;
+}

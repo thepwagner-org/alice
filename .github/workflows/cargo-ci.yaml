@@ -16,7 +16,12 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           persist-credentials: false
-      - run: rustup component add clippy
+      # Pinned to the same rustc the nix dev shell provides. The runner's
+      # default toolchain moves on its own, and clippy gains lints as it
+      # goes -- without this, code that lints clean locally fails here only
+      # after it has been pushed.
+      - run: rustup toolchain install 1.95.0 --profile minimal --component clippy
+      - run: rustup default 1.95.0
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
       - run: cargo build --all-targets
       - run: cargo test

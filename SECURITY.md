@@ -41,7 +41,7 @@ Optional proxy authentication (HTTP Basic over the CONNECT request) restricts wh
 
 **1. Malicious upstream servers**
 
-Alice inspects and modifies some response content (OAuth token redaction, LLM usage parsing) but does not block malicious payloads. A malicious allowed host could return harmful data to Bob. Response-level policy (content filtering, size limits) is not implemented.
+Alice inspects and modifies some response content (OAuth token redaction) but does not block malicious payloads. A malicious allowed host could return harmful data to Bob. Response-level policy (content filtering, size limits) is not implemented.
 
 **2. DNS rebinding attacks (mitigated with CIDR rules)**
 
@@ -269,6 +269,8 @@ Alice can hold real GCP service account private keys and generate dummy keys for
 
 This is a stronger form of credential injection: Bob never sees the real private key, only a dummy that Alice generated. The same trust boundaries apply — the real key exists only in Alice's memory and is subject to the same extraction risks as other credentials (memory dump by same-user process).
 
+Alice does not trust the claims Bob signs into the assertion. At re-sign time she overwrites the `scope` claim with the per-credential configured `scope` (default `cloud-platform`), so Bob cannot mint a token broader than what is configured — a request for a wider scope is narrowed to the configured value. She also strips the `sub` claim: there is no config surface authorizing domain-wide delegation, so Bob cannot use the SA's delegation rights to impersonate a directory user. The RS256 algorithm is pinned on verification so the dummy key's signature cannot be bypassed with `alg: none` or an HMAC confusion attack.
+
 For GCP user credentials (refresh token flow), Alice reads the real gcloud credentials and generates dummy versions for Bob. Refresh token swaps happen transparently at the token endpoint.
 
 ### Defense in Depth: Proxy Authentication
@@ -299,19 +301,6 @@ For high-security deployments:
 For convenience (development/testing):
 - Environment variables are acceptable when Eve is not a concern
 - File-based secrets work well with container secrets or tmpfs mounts
-
-## Request Transforms
-
-Alice supports a configurable transform pipeline that can modify outbound requests before they reach upstream. Transforms include:
-
-- **Injection scanning** — pattern matching on message content to detect prompt injection attempts
-- **Tool filtering** — allow/deny lists for tool names in LLM API requests
-- **System prompt enforcement** — prepend or replace system prompts
-- **Message swaps** — rewrite message content based on pattern matching
-
-These are **best-effort guardrails, not security boundaries**. A determined Bob could craft requests that bypass pattern matching (encoding tricks, semantic rephrasing, etc.). Transforms reduce the attack surface for accidental or naive misuse but should not be relied on as the sole defense against a motivated adversary.
-
-Transforms run after TLS termination and before the request is forwarded upstream. They only apply to requests matching configured host/path patterns (typically LLM API endpoints).
 
 ## Operational Security
 

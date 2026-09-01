@@ -99,7 +99,7 @@ pub fn parse_headers_to_map(headers: &[u8]) -> HashMap<String, String> {
         }
 
         if let Some((name, value)) = line.split_once(':') {
-            map.insert(name.trim().to_lowercase(), value.trim().to_string());
+            let _ = map.insert(name.trim().to_lowercase(), value.trim().to_string());
         }
     }
 

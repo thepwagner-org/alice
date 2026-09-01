@@ -74,6 +74,10 @@ pub struct GcpServiceAccount {
     dummy_decoding_key: DecodingKey,
     /// Path where the dummy key was written
     pub dummy_key_path: String,
+    /// The OAuth scope to enforce on the re-signed token (from config).
+    /// Bob's requested scope is overwritten with this, so Bob cannot escalate
+    /// beyond the configured scope.
+    scope: String,
 }
 
 impl std::fmt::Debug for GcpServiceAccount {
@@ -220,6 +224,7 @@ impl GcpServiceAccount {
             real_private_key_id: real_key.private_key_id,
             dummy_decoding_key,
             dummy_key_path: config.dummy_key_path.display().to_string(),
+            scope: config.scope.clone(),
         })
     }
 
@@ -251,7 +256,7 @@ impl GcpServiceAccount {
 
         // Decode the JWT header to check algorithm, and decode claims
         // First, peek at the claims to check if this JWT is for our service account
-        let claims = self.verify_and_decode_jwt(jwt)?;
+        let mut claims = self.verify_and_decode_jwt(jwt)?;
 
         // Check that the issuer matches our service account
         if claims.iss != self.client_email {
@@ -262,6 +267,30 @@ impl GcpServiceAccount {
             );
             return None;
         }
+
+        // Enforce the configured scope. Bob does not control the minted token's
+        // scope: whatever scope he put in the assertion is overwritten with the
+        // configured value, so he can never escalate beyond what Alice permits.
+        if claims.scope.as_deref() != Some(self.scope.as_str()) {
+            debug!(
+                requested = ?claims.scope,
+                enforced = %self.scope,
+                "overriding requested GCP scope with configured scope"
+            );
+        }
+        claims.scope = Some(self.scope.clone());
+
+        // Pin the subject. `sub` enables domain-wide delegation (impersonating a
+        // user). There is no config surface authorizing it, so strip any value
+        // Bob supplied to prevent him from minting impersonation tokens.
+        if claims.sub.is_some() {
+            warn!(
+                name = %self.name,
+                sub = ?claims.sub,
+                "stripping `sub` from JWT assertion (domain-wide delegation not permitted)"
+            );
+        }
+        claims.sub = None;
 
         // Re-sign the JWT with the real private key
         let mut header = Header::new(Algorithm::RS256);
@@ -648,7 +677,7 @@ impl GcpUserAccount {
     ) -> Result<()> {
         // Remove existing file if present (SQLite won't overwrite cleanly)
         if path.exists() {
-            std::fs::remove_file(path).ok();
+            let _ = std::fs::remove_file(path);
         }
 
         let conn = rusqlite::Connection::open(path).with_context(|| {
@@ -677,16 +706,17 @@ impl GcpUserAccount {
                 )
             })?;
 
-            conn.execute(
-                "INSERT OR REPLACE INTO credentials (account_id, value) VALUES (?1, ?2)",
-                rusqlite::params![account_id, value_json],
-            )
-            .with_context(|| {
-                format!(
-                    "gcp user credential '{}': failed to insert credential for '{}'",
-                    config_name, account_id
+            let _ = conn
+                .execute(
+                    "INSERT OR REPLACE INTO credentials (account_id, value) VALUES (?1, ?2)",
+                    rusqlite::params![account_id, value_json],
                 )
-            })?;
+                .with_context(|| {
+                    format!(
+                        "gcp user credential '{}': failed to insert credential for '{}'",
+                        config_name, account_id
+                    )
+                })?;
         }
 
         debug!(
@@ -702,7 +732,7 @@ impl GcpUserAccount {
     /// Write an empty access_tokens.db (gcloud expects it).
     fn write_empty_access_tokens_db(path: &std::path::Path, config_name: &str) -> Result<()> {
         if path.exists() {
-            std::fs::remove_file(path).ok();
+            let _ = std::fs::remove_file(path);
         }
 
         let conn = rusqlite::Connection::open(path).with_context(|| {
@@ -802,13 +832,15 @@ impl GcpUserAccount {
             for (k, v) in &params {
                 match k.as_str() {
                     "refresh_token" => {
-                        serializer.append_pair("refresh_token", &mapping.real_refresh_token);
+                        let _ =
+                            serializer.append_pair("refresh_token", &mapping.real_refresh_token);
                     }
                     "client_secret" if v == &mapping.dummy_client_secret => {
-                        serializer.append_pair("client_secret", &mapping.real_client_secret);
+                        let _ =
+                            serializer.append_pair("client_secret", &mapping.real_client_secret);
                     }
                     _ => {
-                        serializer.append_pair(k, v);
+                        let _ = serializer.append_pair(k, v);
                     }
                 }
             }
@@ -900,6 +932,7 @@ impl GcpCredentialStore {
 }
 
 #[cfg(test)]
+#[allow(unused_results)]
 mod tests {
     use super::*;
     use std::io::Write;
@@ -1011,6 +1044,75 @@ mod tests {
         assert!(new_body.contains("assertion="));
         // The assertion should be different (re-signed with real key)
         assert!(!new_body.contains(&bob_jwt));
+    }
+
+    #[test]
+    fn test_resign_enforces_configured_scope_and_strips_sub() {
+        let mut real_key_file = NamedTempFile::new().unwrap();
+        let real_key = write_test_sa_key(&mut real_key_file);
+
+        let dummy_key_path = tempfile::NamedTempFile::new().unwrap();
+
+        // Configure a narrow scope.
+        let configured_scope = "https://www.googleapis.com/auth/devstorage.read_only";
+        let config = GcpCredential {
+            name: "test-gcp".to_string(),
+            key_file: real_key_file.path().to_path_buf(),
+            dummy_key_path: dummy_key_path.path().to_path_buf(),
+            scope: configured_scope.to_string(),
+        };
+
+        let sa = GcpServiceAccount::load(&config).unwrap();
+
+        let dummy_json = std::fs::read_to_string(dummy_key_path.path()).unwrap();
+        let dummy_key: ServiceAccountKey = serde_json::from_str(&dummy_json).unwrap();
+        let dummy_encoding_key =
+            EncodingKey::from_rsa_pem(dummy_key.private_key.as_bytes()).unwrap();
+
+        // Bob asks for a much broader scope AND tries to set `sub` for delegation.
+        let claims = GcpJwtClaims {
+            iss: "test@test-project.iam.gserviceaccount.com".to_string(),
+            scope: Some("https://www.googleapis.com/auth/cloud-platform".to_string()),
+            aud: "https://oauth2.googleapis.com/token".to_string(),
+            iat: chrono::Utc::now().timestamp(),
+            exp: chrono::Utc::now().timestamp() + 3600,
+            sub: Some("victim@example.com".to_string()),
+        };
+
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some("alice-dummy-test-gcp".to_string());
+        let bob_jwt = encode(&header, &claims, &dummy_encoding_key).unwrap();
+
+        let body = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("grant_type", JWT_BEARER_GRANT_TYPE)
+            .append_pair("assertion", &bob_jwt)
+            .finish();
+
+        let result = sa.resign_token_request(body.as_bytes()).unwrap();
+        let new_body = String::from_utf8(result).unwrap();
+
+        // Pull the re-signed assertion back out of the rebuilt body.
+        let new_assertion = url::form_urlencoded::parse(new_body.as_bytes())
+            .find(|(k, _)| k == "assertion")
+            .map(|(_, v)| v.into_owned())
+            .unwrap();
+
+        // Decode it with the REAL public key to inspect the enforced claims.
+        let real_public_pem = real_key
+            .to_public_key()
+            .to_pkcs1_pem(LineEnding::LF)
+            .unwrap();
+        let real_decoding_key = DecodingKey::from_rsa_pem(real_public_pem.as_bytes()).unwrap();
+        let mut validation = Validation::new(Algorithm::RS256);
+        validation.set_audience(&["https://oauth2.googleapis.com/token"]);
+        validation.set_required_spec_claims(&["iss", "aud", "exp", "iat"]);
+        let decoded =
+            decode::<GcpJwtClaims>(&new_assertion, &real_decoding_key, &validation).unwrap();
+
+        // Scope is narrowed to the configured value, not Bob's broad request.
+        assert_eq!(decoded.claims.scope.as_deref(), Some(configured_scope));
+        // `sub` is stripped: Bob cannot mint a domain-wide-delegation token.
+        assert_eq!(decoded.claims.sub, None);
     }
 
     #[test]

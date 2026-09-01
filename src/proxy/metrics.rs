@@ -1,12 +1,8 @@
 //! Plain HTTP metrics server for observability.
 //!
-//! Serves:
-//! - `/llm/completions` — LLM completion metrics as JSON
-//! - `/metrics` — Prometheus text exposition format
-//!
+//! Serves `/metrics` in Prometheus text exposition format.
 //! Runs on a separate port from the proxy, no TLS required.
 
-use super::llm::LlmMetricsStore;
 use super::prom::ProxyMetrics;
 use anyhow::Result;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -20,7 +16,6 @@ use tracing::{debug, warn};
 /// an ephemeral port).
 pub async fn spawn(
     listen: &str,
-    store: LlmMetricsStore,
     prom: ProxyMetrics,
 ) -> Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>)> {
     let listener = TcpListener::bind(listen).await?;
@@ -33,9 +28,8 @@ pub async fn spawn(
                 continue;
             };
 
-            let store = store.clone();
             let prom = prom.clone();
-            tokio::spawn(async move {
+            drop(tokio::spawn(async move {
                 let mut buf = vec![0u8; 4096];
                 let n = match stream.read(&mut buf).await {
                     Ok(n) if n > 0 => n,
@@ -49,11 +43,6 @@ pub async fn spawn(
                 let path = first_line.split_whitespace().nth(1).unwrap_or("/");
 
                 let (status, content_type, body) = match path {
-                    "/llm/completions" => {
-                        let metrics = store.lock().await;
-                        let json = serde_json::to_string(&*metrics).unwrap_or("[]".to_string());
-                        ("200 OK", "application/json", json)
-                    }
                     "/metrics" => {
                         let body = prom.render();
                         ("200 OK", "text/plain; version=0.0.4; charset=utf-8", body)
@@ -69,7 +58,7 @@ pub async fn spawn(
                 if let Err(e) = stream.write_all(response.as_bytes()).await {
                     warn!(error = %e, "metrics server write error");
                 }
-            });
+            }));
         }
     });
 

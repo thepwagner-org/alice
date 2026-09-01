@@ -1,8 +1,6 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
-
-use crate::proxy::transform::TransformConfig;
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
@@ -22,9 +20,6 @@ pub struct Config {
     pub gcp_user_credentials: Vec<GcpUserCredential>,
     /// Optional observability configuration
     pub observability: Option<ObservabilityConfig>,
-    /// Ordered list of request transforms for LLM API endpoints.
-    #[serde(default)]
-    pub transforms: Vec<TransformConfig>,
     /// Optional reverse proxy configuration for inbound traffic to sandbox.
     pub reverse_proxy: Option<ReverseProxyConfig>,
 }
@@ -40,17 +35,66 @@ pub struct ReverseProxyConfig {
     pub listen: String,
     /// Backend address to forward to (e.g., "10.0.0.2:3337")
     pub backend: String,
+    /// Splice idle timeout in seconds (default: 300). The bidirectional
+    /// copy is torn down after this long with no data in either
+    /// direction — a backstop against silent wedges where both peers
+    /// stay alive but neither sends.
+    #[serde(default = "default_idle_timeout")]
+    pub idle_timeout_secs: u64,
 }
 
 /// Observability configuration for metrics and distributed tracing
 #[derive(Debug, Deserialize)]
 pub struct ObservabilityConfig {
     /// Plain HTTP endpoint for metrics (e.g., "127.0.0.1:9090")
-    /// Serves /llm/completions (JSON)
+    /// Serves /metrics in Prometheus text exposition format.
     pub metrics_listen: Option<String>,
     /// OTLP endpoint for distributed tracing (e.g., "http://tempo.example.com:4317")
     /// If not set, falls back to OTEL_EXPORTER_OTLP_ENDPOINT env var
     pub otlp_endpoint: Option<String>,
+    /// Optional workload-side OTLP/HTTP collector (telemetry egress)
+    pub collector: Option<CollectorConfig>,
+}
+
+/// Signal type for collector allowlist rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Signal {
+    Traces,
+    Metrics,
+}
+
+/// A single allowlist rule for the telemetry collector.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CollectorRule {
+    pub action: Action,
+    /// Glob pattern matched against span or metric name.
+    pub name: String,
+    /// Optional signal filter; if omitted the rule applies to both traces and metrics.
+    pub signal: Option<Signal>,
+}
+
+/// Workload-side OTLP/HTTP collector that receives telemetry, applies a
+/// name-glob allowlist, and forwards surviving signals to the host collector.
+#[derive(Debug, Deserialize)]
+pub struct CollectorConfig {
+    /// Address to listen on for OTLP/HTTP (e.g., "127.0.0.1:4318").
+    /// Defaults to ephemeral port assignment.
+    #[serde(default = "default_collector_listen")]
+    pub otlp_http_listen: String,
+    /// UDP address to listen on for StatsD (e.g., "127.0.0.1:8125").
+    /// If absent, the StatsD listener is not started.
+    pub statsd_listen: Option<String>,
+    /// gRPC endpoint to forward surviving signals to.
+    /// If absent, falls back to `observability.otlp_endpoint`.
+    pub forward_endpoint: Option<String>,
+    /// Allowlist rules (first-match-wins, default-deny).
+    #[serde(default)]
+    pub rules: Vec<CollectorRule>,
+}
+
+fn default_collector_listen() -> String {
+    "127.0.0.1:0".to_string()
 }
 
 #[derive(Debug, Deserialize)]
@@ -67,9 +111,46 @@ pub struct ProxyConfig {
     /// Connection idle timeout in seconds (default: 300)
     #[serde(default = "default_idle_timeout")]
     pub idle_timeout_secs: u64,
+    /// Maximum total bytes for an HTTP/1.1 header block (default: 65536).
+    /// Bounds slow-loris-style header growth.
+    #[serde(default = "default_max_header_bytes")]
+    pub max_header_bytes: usize,
+    /// Maximum number of header lines in an HTTP/1.1 header block (default: 200).
+    #[serde(default = "default_max_header_count")]
+    pub max_header_count: usize,
+    /// Maximum bytes for a fully-buffered request/response body (default: 104857600 = 100 MiB).
+    /// A claimed Content-Length above this is rejected rather than eagerly allocated.
+    #[serde(default = "default_max_body_bytes")]
+    pub max_body_bytes: u64,
+    /// Maximum bytes produced by gzip decompression (default: 104857600 = 100 MiB).
+    /// Guards against decompression bombs during token redaction.
+    #[serde(default = "default_max_decompressed_bytes")]
+    pub max_decompressed_bytes: u64,
     /// Directory for request/response logs (development only)
     /// When set, all requests are logged with full headers and bodies
     pub log_dir: Option<PathBuf>,
+}
+
+impl ProxyConfig {
+    /// Resolve the configured request-size limits into a compact, copyable struct
+    /// for the hot path.
+    pub fn limits(&self) -> Limits {
+        Limits {
+            max_header_bytes: self.max_header_bytes,
+            max_header_count: self.max_header_count,
+            max_body_bytes: self.max_body_bytes,
+            max_decompressed_bytes: self.max_decompressed_bytes,
+        }
+    }
+}
+
+/// Resolved request-size limits (defense-in-depth against memory-exhaustion DoS).
+#[derive(Debug, Clone, Copy)]
+pub struct Limits {
+    pub max_header_bytes: usize,
+    pub max_header_count: usize,
+    pub max_body_bytes: u64,
+    pub max_decompressed_bytes: u64,
 }
 
 fn default_max_connections() -> usize {
@@ -78,6 +159,22 @@ fn default_max_connections() -> usize {
 
 fn default_idle_timeout() -> u64 {
     300
+}
+
+fn default_max_header_bytes() -> usize {
+    64 * 1024
+}
+
+fn default_max_header_count() -> usize {
+    200
+}
+
+fn default_max_body_bytes() -> u64 {
+    100 * 1024 * 1024
+}
+
+fn default_max_decompressed_bytes() -> u64 {
+    100 * 1024 * 1024
 }
 
 #[derive(Debug, Deserialize)]
@@ -204,6 +301,17 @@ pub struct Credential {
     pub env: Option<String>,
     /// File path containing the real secret
     pub file: Option<PathBuf>,
+    /// Path to a sanctum broker's Unix domain socket.
+    /// alice connects to this gRPC socket on `refresh_interval_secs`
+    /// and uses the returned `access_token` as the secret value (formatted
+    /// via `format`, just like `env`/`file`).
+    pub sanctum_path: Option<PathBuf>,
+    /// Credential slot name within the broker's vault (e.g. "claude0").
+    /// Required when `sanctum_path` is set.
+    pub sanctum_name: Option<String>,
+    /// Refresh interval in seconds for `sanctum_path` (default: 60).
+    /// Only valid when `sanctum_path` is set.
+    pub refresh_interval_secs: Option<u64>,
 }
 
 /// GCP service account credential configuration.
@@ -218,9 +326,10 @@ pub struct GcpCredential {
     /// Path where Alice writes the dummy SA key file for Bob
     pub dummy_key_path: PathBuf,
     /// OAuth scope (default: "https://www.googleapis.com/auth/cloud-platform")
-    /// Reserved for future use when Alice constructs JWTs from scratch.
+    /// Enforced at re-sign time: Alice overwrites the `scope` claim of Bob's
+    /// JWT assertion with this value, so Bob cannot mint a token broader than
+    /// what is configured here.
     #[serde(default = "default_gcp_scope")]
-    #[allow(dead_code)]
     pub scope: String,
 }
 
@@ -241,11 +350,33 @@ fn default_gcp_scope() -> String {
     "https://www.googleapis.com/auth/cloud-platform".to_string()
 }
 
+impl Config {
+    /// Validate invariants that serde cannot express on its own.
+    ///
+    /// Fails fast at load time so misconfigurations surface at startup
+    /// rather than as runtime surprises.
+    fn validate(&self) -> Result<()> {
+        // Both validities feed `not_after = now + hours * 3600`, and the
+        // host-cert cache TTL is `host_cert_validity_hours * 3600 - 300`.
+        // A zero validity yields an instantly-expired cert and underflows
+        // the TTL subtraction (u64 wraparound to a near-infinite TTL).
+        if self.ca.validity_hours == 0 {
+            bail!("ca.validity_hours must be greater than 0");
+        }
+        if self.ca.host_cert_validity_hours == 0 {
+            bail!("ca.host_cert_validity_hours must be greater than 0");
+        }
+
+        Ok(())
+    }
+}
+
 pub fn load(path: &Path) -> Result<Config> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read config file: {}", path.display()))?;
 
     let config: Config = toml::from_str(&content).with_context(|| "failed to parse config file")?;
+    config.validate()?;
 
     Ok(config)
 }
@@ -290,6 +421,46 @@ host = "*"
     }
 
     #[test]
+    fn test_limits_defaults() {
+        let toml = r#"
+[proxy]
+listen = "127.0.0.1:3128"
+
+[ca]
+cert_path = "/tmp/alice-ca.pem"
+"#;
+
+        let config: Config = toml::from_str(toml).unwrap();
+        let limits = config.proxy.limits();
+        assert_eq!(limits.max_header_bytes, 64 * 1024);
+        assert_eq!(limits.max_header_count, 200);
+        assert_eq!(limits.max_body_bytes, 100 * 1024 * 1024);
+        assert_eq!(limits.max_decompressed_bytes, 100 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_limits_override() {
+        let toml = r#"
+[proxy]
+listen = "127.0.0.1:3128"
+max_header_bytes = 8192
+max_header_count = 50
+max_body_bytes = 1048576
+max_decompressed_bytes = 2097152
+
+[ca]
+cert_path = "/tmp/alice-ca.pem"
+"#;
+
+        let config: Config = toml::from_str(toml).unwrap();
+        let limits = config.proxy.limits();
+        assert_eq!(limits.max_header_bytes, 8192);
+        assert_eq!(limits.max_header_count, 50);
+        assert_eq!(limits.max_body_bytes, 1048576);
+        assert_eq!(limits.max_decompressed_bytes, 2097152);
+    }
+
+    #[test]
     fn test_parse_reverse_proxy() {
         let toml = r#"
 [proxy]
@@ -307,6 +478,7 @@ backend = "10.0.0.2:3337"
         let rp = config.reverse_proxy.unwrap();
         assert_eq!(rp.listen, "127.0.0.1:0");
         assert_eq!(rp.backend, "10.0.0.2:3337");
+        assert_eq!(rp.idle_timeout_secs, 300);
     }
 
     #[test]
@@ -321,6 +493,115 @@ cert_path = "/tmp/alice-ca.pem"
 
         let config: Config = toml::from_str(toml).unwrap();
         assert!(config.reverse_proxy.is_none());
+    }
+
+    #[test]
+    fn test_parse_collector_config() {
+        let toml = r#"
+[proxy]
+listen = "127.0.0.1:3128"
+
+[ca]
+cert_path = "/tmp/alice-ca.pem"
+
+[observability]
+otlp_endpoint = "http://otel.example.com:4317"
+
+[observability.collector]
+otlp_http_listen = "127.0.0.1:4318"
+forward_endpoint = "http://otel.example.com:4317"
+
+[[observability.collector.rules]]
+action = "allow"
+name = "myapp.*"
+signal = "traces"
+
+[[observability.collector.rules]]
+action = "allow"
+name = "myapp_*"
+"#;
+
+        let config: Config = toml::from_str(toml).unwrap();
+        let obs = config.observability.unwrap();
+        let col = obs.collector.unwrap();
+        assert_eq!(col.otlp_http_listen, "127.0.0.1:4318");
+        assert_eq!(col.rules.len(), 2);
+        assert_eq!(col.rules[0].name, "myapp.*");
+        assert_eq!(col.rules[0].signal, Some(Signal::Traces));
+        assert_eq!(col.rules[1].signal, None);
+        assert!(col.statsd_listen.is_none());
+    }
+
+    #[test]
+    fn test_parse_collector_statsd_listen() {
+        let toml = r#"
+[proxy]
+listen = "127.0.0.1:3128"
+
+[ca]
+cert_path = "/tmp/alice-ca.pem"
+
+[observability.collector]
+statsd_listen = "127.0.0.1:8125"
+forward_endpoint = "http://otel.example.com:4317"
+"#;
+
+        let config: Config = toml::from_str(toml).unwrap();
+        let col = config.observability.unwrap().collector.unwrap();
+        assert_eq!(col.statsd_listen, Some("127.0.0.1:8125".to_string()));
+        assert!(col.rules.is_empty());
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_host_cert_validity() {
+        let toml = r#"
+[proxy]
+listen = "127.0.0.1:3128"
+
+[ca]
+cert_path = "/tmp/alice-ca.pem"
+host_cert_validity_hours = 0
+"#;
+
+        let config: Config = toml::from_str(toml).unwrap();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("host_cert_validity_hours"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_ca_validity() {
+        let toml = r#"
+[proxy]
+listen = "127.0.0.1:3128"
+
+[ca]
+cert_path = "/tmp/alice-ca.pem"
+validity_hours = 0
+"#;
+
+        let config: Config = toml::from_str(toml).unwrap();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("validity_hours"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn test_validate_accepts_default_validity() {
+        let toml = r#"
+[proxy]
+listen = "127.0.0.1:3128"
+
+[ca]
+cert_path = "/tmp/alice-ca.pem"
+"#;
+
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.validate().is_ok());
+        // defaults are non-zero
+        assert_eq!(config.ca.validity_hours, 6);
+        assert_eq!(config.ca.host_cert_validity_hours, 2);
     }
 
     #[test]

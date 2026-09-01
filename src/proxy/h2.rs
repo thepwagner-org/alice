@@ -1,9 +1,7 @@
 //! HTTP/2 proxy handler with request inspection for path-based policy.
 
 use crate::config::Action;
-use crate::proxy::llm;
 use crate::proxy::request::{self, RequestOutcome};
-use crate::proxy::transform::TransformResult;
 use crate::proxy::ProxyState;
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
@@ -82,7 +80,7 @@ where
         let resolved_ips = resolved_ips.clone();
         let client_addr = client_addr.clone();
 
-        stream_tasks.spawn(
+        let _ = stream_tasks.spawn(
             async move {
                 if let Err(e) = handle_stream(
                     request,
@@ -153,7 +151,7 @@ where
         let resolved_ips = resolved_ips.clone();
         let client_addr = client_addr.clone();
 
-        tokio::spawn(
+        drop(tokio::spawn(
             async move {
                 if let Err(e) = handle_stream_to_h1(
                     request,
@@ -170,7 +168,7 @@ where
                 }
             }
             .instrument(Span::current()),
-        );
+        ));
     }
 
     Ok(())
@@ -238,13 +236,14 @@ where
             response_body: &[],
         };
         deny.record_deny(&request_span, &state.metrics, "h2->h1");
-        let deny_response = http::Response::builder().status(403).body(()).unwrap();
+        let mut deny_response = http::Response::new(());
+        *deny_response.status_mut() = http::StatusCode::FORBIDDEN;
         let _ = respond.send_response(deny_response, true);
         return Ok(());
     }
 
-    request_span.record("alice.policy.action", "allow");
-    request_span.record("alice.policy.rule_index", decision.rule_index as i64);
+    let _ = request_span.record("alice.policy.action", "allow");
+    let _ = request_span.record("alice.policy.rule_index", decision.rule_index as i64);
     info!(
         host = %host,
         path = %path,
@@ -271,15 +270,6 @@ where
         body_bytes.extend_from_slice(&data);
     }
 
-    // Run transform pipeline on /v1/messages requests
-    if let Some(TransformResult::Block { .. }) =
-        request::apply_transforms(&state.transform_pipeline, &host, &path, &mut body_bytes)
-    {
-        let deny_response = http::Response::builder().status(403).body(()).unwrap();
-        let _ = respond.send_response(deny_response, true);
-        return Ok(());
-    }
-
     // GCP JWT re-signing: intercept token exchange POST bodies
     if state.gcp_credentials.is_gcp_token_request(&host, &path) {
         if let Some(new_body) = state.gcp_credentials.resign_token_request(&body_bytes) {
@@ -291,19 +281,43 @@ where
     let mut request_text = format!("{} {} HTTP/1.1\r\n", parts.method, &path);
     request_text.push_str(&format!("Host: {}\r\n", host));
 
-    // Copy headers (skip pseudo-headers which start with :)
+    // Build the connection-token denylist. These headers are forbidden in
+    // HTTP/2, but we filter defensively so a malformed h2 peer can't smuggle
+    // framing directives across the h2->h1 downgrade.
+    let connection_tokens: Vec<String> = parts
+        .headers
+        .get_all("connection")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(',').map(|t| t.trim().to_ascii_lowercase()))
+        .filter(|t| !t.is_empty())
+        .collect();
+
+    // Copy headers, skipping pseudo-headers (which start with ':') and
+    // hop-by-hop / framing headers. alice owns framing on the h1 side, so
+    // Connection, Transfer-Encoding, Keep-Alive, Proxy-*, anything named in
+    // Connection, and Content-Length are all dropped here.
     for (name, value) in parts.headers.iter() {
         let name_str = name.as_str();
-        if !name_str.starts_with(':') {
-            request_text.push_str(&format!(
-                "{}: {}\r\n",
-                name_str,
-                value.to_str().unwrap_or("")
-            ));
+        if name_str.starts_with(':') {
+            continue;
         }
+        let lower = name_str.to_ascii_lowercase();
+        if lower == "content-length"
+            || crate::proxy::http::is_hop_by_hop(&lower)
+            || connection_tokens.contains(&lower)
+        {
+            continue;
+        }
+        request_text.push_str(&format!(
+            "{}: {}\r\n",
+            name_str,
+            value.to_str().unwrap_or("")
+        ));
     }
 
-    // Add Content-Length if we have a body
+    // alice is authoritative on length: emit a single Content-Length matching
+    // the body we actually forward.
     if !body_bytes.is_empty() {
         request_text.push_str(&format!("Content-Length: {}\r\n", body_bytes.len()));
     }
@@ -331,7 +345,7 @@ where
 
     // Read status line
     let mut status_line = String::new();
-    reader
+    let _ = reader
         .read_line(&mut status_line)
         .await
         .context("failed to read H1.1 status line")?;
@@ -346,10 +360,11 @@ where
     let mut response_headers = Vec::new();
     let mut content_length: Option<usize> = None;
     let mut chunked = false;
+    let mut server_wants_close = false;
 
     loop {
         let mut line = String::new();
-        reader.read_line(&mut line).await?;
+        let _ = reader.read_line(&mut line).await?;
         if line == "\r\n" || line == "\n" {
             break;
         }
@@ -361,64 +376,14 @@ where
                 content_length = value.parse().ok();
             } else if name == "transfer-encoding" && value.to_lowercase().contains("chunked") {
                 chunked = true;
+            } else if name == "connection" && value.to_lowercase().contains("close") {
+                server_wants_close = true;
             }
             response_headers.push((name, value.to_string()));
         }
     }
 
-    // Read response body
-    let response_body = if chunked {
-        read_chunked_body(&mut reader).await?
-    } else if let Some(len) = content_length {
-        let mut buf = vec![0u8; len];
-        reader.read_exact(&mut buf).await?;
-        buf
-    } else {
-        // No body or connection: close semantics
-        Vec::new()
-    };
-
-    // Release upstream lock
-    drop(reader);
-    drop(upstream_guard);
-
-    // Redact OAuth tokens if this path is configured for redaction
-    let response_body = if decision.redact_tokens {
-        if let Some(redacted_body) = state
-            .credentials
-            .redact_oauth_response(&host, &response_body)
-        {
-            redacted_body
-        } else {
-            response_body
-        }
-    } else {
-        response_body
-    };
-
-    // Build H2 response
-    let mut response_builder = http::Response::builder().status(status_code);
-    for (name, value) in &response_headers {
-        // Skip hop-by-hop headers
-        if matches!(
-            name.as_str(),
-            "connection" | "keep-alive" | "transfer-encoding" | "upgrade"
-        ) {
-            continue;
-        }
-        // Update content-length to match (possibly redacted) body
-        if name == "content-length" && decision.redact_tokens {
-            response_builder =
-                response_builder.header("content-length", response_body.len().to_string());
-            continue;
-        }
-        response_builder = response_builder.header(name.as_str(), value.as_str());
-    }
-    let h2_response = response_builder
-        .body(())
-        .context("failed to build H2 response")?;
-
-    // Format response headers for logging
+    // Format response headers for logging (independent of the body).
     let response_headers_raw = {
         let mut buf = Vec::new();
         for (name, value) in &response_headers {
@@ -431,17 +396,103 @@ where
         buf
     };
 
-    // Send response to client
-    let end_stream = response_body.is_empty();
-    let mut send_body = respond
-        .send_response(h2_response, end_stream)
-        .context("failed to send H2 response")?;
+    // A 1xx/204/304 response carries no body regardless of framing headers; we
+    // must not try to read one (it would block until the connection closes).
+    let status_has_body =
+        !(status_code == 204 || status_code == 304 || (100..200).contains(&status_code));
 
-    if !end_stream {
-        send_body
-            .send_data(Bytes::from(response_body.clone()), true)
-            .context("failed to send H2 response body")?;
-    }
+    // Decide how the body is framed on the h1 side.
+    let framing = if chunked {
+        H1Framing::Chunked
+    } else if let Some(len) = content_length {
+        H1Framing::Length(len as u64)
+    } else if server_wants_close && status_has_body {
+        // No Content-Length and not chunked: body runs until the upstream
+        // closes the connection (RFC 7230 §3.3.3). Previously this case
+        // dropped the body entirely.
+        H1Framing::UntilClose
+    } else {
+        H1Framing::Length(0)
+    };
+
+    let (response_body, response_body_len) = if decision.redact_tokens {
+        // Token redaction needs the whole JSON body, so buffer it.
+        let response_body =
+            read_h1_body_buffered(&mut reader, framing, state.limits.max_body_bytes).await?;
+
+        // Release upstream lock before the (CPU-bound) redaction + send.
+        drop(reader);
+        drop(upstream_guard);
+
+        let response_body = if let Some(redacted_body) = state
+            .credentials
+            .redact_oauth_response(&host, &response_body)
+        {
+            redacted_body
+        } else {
+            response_body
+        };
+
+        let h2_response =
+            build_h2_response(status_code, &response_headers, Some(response_body.len()))?;
+
+        let end_stream = response_body.is_empty();
+        let mut send_body = respond
+            .send_response(h2_response, end_stream)
+            .context("failed to send H2 response")?;
+        if !end_stream {
+            send_body
+                .send_data(Bytes::from(response_body.clone()), true)
+                .context("failed to send H2 response body")?;
+        }
+
+        let len = response_body.len();
+        (response_body, len)
+    } else {
+        // Stream the body through to the client as it arrives, so SSE events
+        // (and any other streamed/chunked response) are forwarded incrementally
+        // instead of being buffered until the upstream finishes.
+        let h2_response = build_h2_response(status_code, &response_headers, None)?;
+
+        let no_body = matches!(framing, H1Framing::Length(0));
+        let mut send_body = respond
+            .send_response(h2_response, no_body)
+            .context("failed to send H2 response")?;
+
+        if no_body {
+            drop(reader);
+            drop(upstream_guard);
+            (Vec::new(), 0)
+        } else {
+            // Capture the full body only when logging; otherwise keep just a
+            // small leading excerpt for non-2xx errors (for the journal).
+            let capture_cap = if state.log_dir.is_some() {
+                state.limits.max_body_bytes as usize
+            } else if (400..600).contains(&status_code) {
+                request::NON_2XX_EXCERPT_CAP
+            } else {
+                0
+            };
+
+            let (captured, total) = stream_h1_body_to_h2(
+                &mut reader,
+                &mut send_body,
+                framing,
+                state.limits.max_body_bytes,
+                capture_cap,
+            )
+            .await?;
+
+            drop(reader);
+            drop(upstream_guard);
+
+            send_body
+                .send_data(Bytes::new(), true)
+                .context("failed to end client body")?;
+
+            (captured, total)
+        }
+    };
 
     // Record span, metrics, and log the exchange
     let outcome = RequestOutcome {
@@ -452,7 +503,7 @@ where
         action: "allow",
         rule_index: decision.rule_index,
         request_bytes: request_text.len() + body_bytes.len(),
-        response_bytes: response_headers_raw.len() + response_body.len(),
+        response_bytes: response_headers_raw.len() + response_body_len,
         start: request_start,
         client_addr: &client_addr,
         request_headers: &request_headers_raw,
@@ -462,35 +513,246 @@ where
     };
     outcome.record_span(&request_span);
     outcome.record_metrics(&state.metrics);
+    outcome.record_summary();
     outcome.log_exchange(&state.log_dir).await;
 
     Ok(())
 }
 
-/// Read a chunked HTTP/1.1 body
-async fn read_chunked_body<R: AsyncBufReadExt + Unpin>(reader: &mut R) -> Result<Vec<u8>> {
+/// How an HTTP/1.1 response body is framed on the wire.
+#[derive(Debug, Clone, Copy)]
+enum H1Framing {
+    /// `Transfer-Encoding: chunked`.
+    Chunked,
+    /// Fixed-length body (`Content-Length`); 0 means no body.
+    Length(u64),
+    /// Neither Content-Length nor chunked: body runs until the connection
+    /// closes (RFC 7230 §3.3.3).
+    UntilClose,
+}
+
+/// Build the HTTP/2 response (status + headers) to send to the client from the
+/// parsed HTTP/1.1 response headers. Hop-by-hop headers (including
+/// `Transfer-Encoding`, which has no meaning in h2) are stripped. When
+/// `content_length_override` is `Some`, an existing `Content-Length` header is
+/// rewritten to that value (used after token redaction changes the body size).
+fn build_h2_response(
+    status_code: u16,
+    response_headers: &[(String, String)],
+    content_length_override: Option<usize>,
+) -> Result<http::Response<()>> {
+    let mut builder = http::Response::builder().status(status_code);
+    for (name, value) in response_headers {
+        if matches!(
+            name.as_str(),
+            "connection" | "keep-alive" | "transfer-encoding" | "upgrade"
+        ) {
+            continue;
+        }
+        if name == "content-length" {
+            if let Some(len) = content_length_override {
+                builder = builder.header("content-length", len.to_string());
+                continue;
+            }
+        }
+        builder = builder.header(name.as_str(), value.as_str());
+    }
+    builder.body(()).context("failed to build H2 response")
+}
+
+/// Read an entire HTTP/1.1 response body into memory according to `framing`,
+/// bounded by `max_bytes`. Used for the buffering paths (token redaction).
+async fn read_h1_body_buffered<R: AsyncBufReadExt + Unpin>(
+    reader: &mut R,
+    framing: H1Framing,
+    max_bytes: u64,
+) -> Result<Vec<u8>> {
+    match framing {
+        H1Framing::Length(0) => Ok(Vec::new()),
+        H1Framing::Chunked => read_chunked_body(reader, max_bytes).await,
+        H1Framing::Length(len) => {
+            // Reject a forged Content-Length before allocating the claimed size.
+            if len > max_bytes {
+                return Err(anyhow!(
+                    "response body length {} exceeds maximum of {} bytes",
+                    len,
+                    max_bytes
+                ));
+            }
+            let mut buf = vec![0u8; len as usize];
+            let _ = reader.read_exact(&mut buf).await?;
+            Ok(buf)
+        }
+        H1Framing::UntilClose => {
+            let mut buf = Vec::new();
+            let mut tmp = vec![0u8; 65536];
+            loop {
+                let n = reader.read(&mut tmp).await?;
+                if n == 0 {
+                    break;
+                }
+                if buf.len() as u64 + n as u64 > max_bytes {
+                    return Err(anyhow!(
+                        "response body exceeds maximum of {} bytes",
+                        max_bytes
+                    ));
+                }
+                buf.extend_from_slice(&tmp[..n]);
+            }
+            Ok(buf)
+        }
+    }
+}
+
+/// Stream an HTTP/1.1 response body into an HTTP/2 send stream, forwarding each
+/// piece as it is read so streamed responses (SSE) reach the client
+/// incrementally. Returns `(captured, total_bytes)`, where `captured` holds at
+/// most `capture_cap` leading bytes for logging (the full body is forwarded
+/// regardless). The terminal empty/end-stream frame is sent by the caller.
+async fn stream_h1_body_to_h2<R: AsyncBufReadExt + Unpin>(
+    reader: &mut R,
+    send_body: &mut h2::SendStream<Bytes>,
+    framing: H1Framing,
+    max_bytes: u64,
+    capture_cap: usize,
+) -> Result<(Vec<u8>, usize)> {
+    let mut captured = Vec::new();
+    let mut total: usize = 0;
+
+    // Forward one slice to the client and retain a capped prefix for logging.
+    // A local `fn` (not a closure) so it doesn't borrow `captured` for the whole
+    // function — that would block returning it at the end.
+    fn emit(
+        data: &[u8],
+        captured: &mut Vec<u8>,
+        capture_cap: usize,
+        send_body: &mut h2::SendStream<Bytes>,
+    ) -> Result<()> {
+        if captured.len() < capture_cap {
+            let take = (capture_cap - captured.len()).min(data.len());
+            captured.extend_from_slice(&data[..take]);
+        }
+        send_body
+            .send_data(Bytes::copy_from_slice(data), false)
+            .context("failed to send body chunk to client")
+    }
+
+    match framing {
+        H1Framing::Length(0) => {}
+        H1Framing::Length(len) => {
+            let mut remaining = len;
+            let mut buf = vec![0u8; 65536];
+            while remaining > 0 {
+                let to_read = std::cmp::min(remaining as usize, buf.len());
+                let n = reader.read(&mut buf[..to_read]).await?;
+                if n == 0 {
+                    return Err(anyhow!("unexpected EOF reading body"));
+                }
+                total += n;
+                emit(&buf[..n], &mut captured, capture_cap, send_body)?;
+                remaining -= n as u64;
+            }
+        }
+        H1Framing::UntilClose => {
+            let mut buf = vec![0u8; 65536];
+            loop {
+                let n = reader.read(&mut buf).await?;
+                if n == 0 {
+                    break;
+                }
+                total += n;
+                emit(&buf[..n], &mut captured, capture_cap, send_body)?;
+            }
+        }
+        H1Framing::Chunked => loop {
+            let mut size_line = String::new();
+            let _ = reader.read_line(&mut size_line).await?;
+            let size_str = size_line.trim();
+            let size_hex = size_str.split(';').next().unwrap_or(size_str);
+            let chunk_size = usize::from_str_radix(size_hex, 16).context("invalid chunk size")?;
+
+            if chunk_size == 0 {
+                // Terminal chunk: consume trailing CRLF / trailers.
+                loop {
+                    let mut trailer = String::new();
+                    let _ = reader.read_line(&mut trailer).await?;
+                    if trailer == "\r\n" || trailer == "\n" {
+                        break;
+                    }
+                }
+                break;
+            }
+
+            // Bound a single chunk's claimed size so a forged header can't drive
+            // a huge per-chunk read buffer.
+            if chunk_size as u64 > max_bytes {
+                return Err(anyhow!(
+                    "chunk size {} exceeds maximum of {} bytes",
+                    chunk_size,
+                    max_bytes
+                ));
+            }
+
+            let mut remaining = chunk_size;
+            let mut buf = vec![0u8; 65536];
+            while remaining > 0 {
+                let to_read = std::cmp::min(remaining, buf.len());
+                let n = reader.read(&mut buf[..to_read]).await?;
+                if n == 0 {
+                    return Err(anyhow!("unexpected EOF in chunk"));
+                }
+                total += n;
+                emit(&buf[..n], &mut captured, capture_cap, send_body)?;
+                remaining -= n;
+            }
+
+            let mut crlf = [0u8; 2];
+            let _ = reader.read_exact(&mut crlf).await?;
+        },
+    }
+
+    Ok((captured, total))
+}
+
+/// Read a chunked HTTP/1.1 body, bounding total accumulation at `max_bytes`
+/// so a forged chunk size can't drive an unbounded allocation.
+async fn read_chunked_body<R: AsyncBufReadExt + Unpin>(
+    reader: &mut R,
+    max_bytes: u64,
+) -> Result<Vec<u8>> {
     let mut body = Vec::new();
 
     loop {
         let mut size_line = String::new();
-        reader.read_line(&mut size_line).await?;
+        let _ = reader.read_line(&mut size_line).await?;
         let size_str = size_line.trim();
-        let chunk_size = usize::from_str_radix(size_str, 16).context("invalid chunk size")?;
+        // A chunk-size line may carry chunk extensions after a ';' (RFC 7230
+        // §4.1.1); strip them before parsing the hex size rather than letting
+        // them corrupt the parse.
+        let size_hex = size_str.split(';').next().unwrap_or(size_str);
+        let chunk_size = usize::from_str_radix(size_hex, 16).context("invalid chunk size")?;
+
+        if body.len() as u64 + chunk_size as u64 > max_bytes {
+            return Err(anyhow!(
+                "chunked body exceeds maximum of {} bytes",
+                max_bytes
+            ));
+        }
 
         if chunk_size == 0 {
             // Read trailing CRLF
             let mut trailing = String::new();
-            reader.read_line(&mut trailing).await?;
+            let _ = reader.read_line(&mut trailing).await?;
             break;
         }
 
         let mut chunk = vec![0u8; chunk_size];
-        reader.read_exact(&mut chunk).await?;
+        let _ = reader.read_exact(&mut chunk).await?;
         body.extend_from_slice(&chunk);
 
         // Read chunk-ending CRLF
         let mut crlf = [0u8; 2];
-        reader.read_exact(&mut crlf).await?;
+        let _ = reader.read_exact(&mut crlf).await?;
     }
 
     Ok(body)
@@ -555,13 +817,14 @@ async fn handle_stream(
             response_body: &[],
         };
         deny.record_deny(&request_span, &state.metrics, "h2");
-        let deny_response = http::Response::builder().status(403).body(()).unwrap();
+        let mut deny_response = http::Response::new(());
+        *deny_response.status_mut() = http::StatusCode::FORBIDDEN;
         let _ = respond.send_response(deny_response, true);
         return Ok(());
     }
 
-    request_span.record("alice.policy.action", "allow");
-    request_span.record("alice.policy.rule_index", decision.rule_index as i64);
+    let _ = request_span.record("alice.policy.action", "allow");
+    let _ = request_span.record("alice.policy.rule_index", decision.rule_index as i64);
     info!(
         host = %host,
         path = %path,
@@ -579,12 +842,9 @@ async fn handle_stream(
     // Inject credentials if needed
     inject_credentials_h2(&mut parts.headers, &host, &state);
 
-    // Check if we need to buffer the request body for transform pipeline or GCP re-signing
+    // Buffer the request body only when GCP token re-signing needs to rewrite
+    // it; otherwise stream it straight through.
     let needs_gcp_resign = state.gcp_credentials.is_gcp_token_request(&host, &path);
-    let needs_body_transform = (!state.transform_pipeline.is_empty()
-        && llm::is_messages_endpoint(&path)
-        && !body.is_end_stream())
-        || needs_gcp_resign;
 
     // Only capture body bytes into memory when logging is enabled
     let needs_body_capture = state.log_dir.is_some();
@@ -601,108 +861,105 @@ async fn handle_stream(
         .context("upstream not ready for request")?;
 
     // Send request and body to upstream, returning (response_future, captured_body, body_len)
-    let (upstream_response, request_body_buf, request_body_len) = if needs_body_transform {
-        // Buffer the entire body, run transforms, then send
-        let mut buf = Vec::new();
-        while let Some(chunk) = body.data().await {
-            let data = chunk.context("error reading client body")?;
-            buf.extend_from_slice(&data);
-            body.flow_control()
-                .release_capacity(data.len())
-                .context("failed to release client flow control")?;
-        }
-
-        // Run transform pipeline
-        if let Some(TransformResult::Block { .. }) =
-            request::apply_transforms(&state.transform_pipeline, &host, &path, &mut buf)
-        {
-            let deny_response = http::Response::builder().status(403).body(()).unwrap();
-            let _ = respond.send_response(deny_response, true);
-            return Ok(());
-        }
-
-        // GCP JWT re-signing: intercept token exchange POST bodies
-        if needs_gcp_resign {
-            if let Some(new_body) = state.gcp_credentials.resign_token_request(&buf) {
-                buf = new_body;
-            }
-        }
-
-        // Send headers, then the modified body as a single data frame
-        let end_stream = buf.is_empty();
-        let (response_fut, mut send_body) = upstream_send
-            .send_request(upstream_request, end_stream)
-            .context("failed to send request to upstream")?;
-
-        if !buf.is_empty() {
-            send_body
-                .send_data(Bytes::from(buf.clone()), true)
-                .context("failed to send modified body to upstream")?;
-        }
-
-        let len = buf.len();
-        (
-            response_fut
-                .await
-                .context("failed to receive upstream response")?,
-            buf,
-            len,
-        )
-    } else {
-        // Stream body through without buffering
-        let (response_fut, mut send_body) = upstream_send
-            .send_request(upstream_request, body_is_end)
-            .context("failed to send request to upstream")?;
-
-        let mut body_buf = Vec::new();
-        let mut body_len: usize = 0;
-        if !body_is_end {
+    let (upstream_response, request_body_buf, request_body_len) =
+        if needs_gcp_resign && !body_is_end {
+            // Buffer the entire body, re-sign GCP JWT, then send
+            let mut buf = Vec::new();
             while let Some(chunk) = body.data().await {
                 let data = chunk.context("error reading client body")?;
-                body_len += data.len();
-                if needs_body_capture {
-                    body_buf.extend_from_slice(&data);
+                if buf.len() as u64 + data.len() as u64 > state.limits.max_body_bytes {
+                    return Err(anyhow!(
+                        "request body exceeds maximum of {} bytes",
+                        state.limits.max_body_bytes
+                    ));
                 }
+                buf.extend_from_slice(&data);
                 body.flow_control()
                     .release_capacity(data.len())
                     .context("failed to release client flow control")?;
+            }
+
+            if let Some(new_body) = state.gcp_credentials.resign_token_request(&buf) {
+                buf = new_body;
+            }
+
+            // Send headers, then the (possibly rewritten) body as a single data frame
+            let end_stream = buf.is_empty();
+            let (response_fut, mut send_body) = upstream_send
+                .send_request(upstream_request, end_stream)
+                .context("failed to send request to upstream")?;
+
+            if !buf.is_empty() {
                 send_body
-                    .send_data(data, false)
+                    .send_data(Bytes::from(buf.clone()), true)
                     .context("failed to send body to upstream")?;
             }
-            if let Some(trailers) = body
-                .trailers()
-                .await
-                .context("error reading client trailers")?
-            {
-                send_body
-                    .send_trailers(trailers)
-                    .context("failed to send trailers to upstream")?;
-            } else {
-                send_body
-                    .send_data(Bytes::new(), true)
-                    .context("failed to end upstream body")?;
-            }
-        }
 
-        (
-            response_fut
-                .await
-                .context("failed to receive upstream response")?,
-            body_buf,
-            body_len,
-        )
-    };
+            let len = buf.len();
+            (
+                response_fut
+                    .await
+                    .context("failed to receive upstream response")?,
+                buf,
+                len,
+            )
+        } else {
+            // Stream body through without buffering
+            let (response_fut, mut send_body) = upstream_send
+                .send_request(upstream_request, body_is_end)
+                .context("failed to send request to upstream")?;
+
+            let mut body_buf = Vec::new();
+            let mut body_len: usize = 0;
+            if !body_is_end {
+                while let Some(chunk) = body.data().await {
+                    let data = chunk.context("error reading client body")?;
+                    body_len += data.len();
+                    if needs_body_capture {
+                        if body_buf.len() as u64 + data.len() as u64 > state.limits.max_body_bytes {
+                            return Err(anyhow!(
+                                "request body exceeds maximum of {} bytes",
+                                state.limits.max_body_bytes
+                            ));
+                        }
+                        body_buf.extend_from_slice(&data);
+                    }
+                    body.flow_control()
+                        .release_capacity(data.len())
+                        .context("failed to release client flow control")?;
+                    send_body
+                        .send_data(data, false)
+                        .context("failed to send body to upstream")?;
+                }
+                if let Some(trailers) = body
+                    .trailers()
+                    .await
+                    .context("error reading client trailers")?
+                {
+                    send_body
+                        .send_trailers(trailers)
+                        .context("failed to send trailers to upstream")?;
+                } else {
+                    send_body
+                        .send_data(Bytes::new(), true)
+                        .context("failed to end upstream body")?;
+                }
+            }
+
+            (
+                response_fut
+                    .await
+                    .context("failed to receive upstream response")?,
+                body_buf,
+                body_len,
+            )
+        };
 
     let (response_parts, mut upstream_body) = upstream_response.into_parts();
     let response_status = response_parts.status.as_u16();
 
     // Capture response headers for logging
     let response_headers_raw = format_h2_headers_for_log(&response_parts.headers);
-
-    // Check if this is an LLM SSE stream before consuming response_parts
-    let is_llm_sse =
-        llm::is_messages_endpoint(&path) && llm::is_sse_header_map(&response_parts.headers);
 
     // Build response to send to client
     let mut client_response = http::Response::from_parts(response_parts, ());
@@ -716,6 +973,13 @@ async fn handle_stream(
         if !upstream_body_is_end {
             while let Some(chunk) = upstream_body.data().await {
                 let data = chunk.context("error reading upstream body")?;
+                if response_body_buf.len() as u64 + data.len() as u64 > state.limits.max_body_bytes
+                {
+                    return Err(anyhow!(
+                        "response body exceeds maximum of {} bytes",
+                        state.limits.max_body_bytes
+                    ));
+                }
                 response_body_buf.extend_from_slice(&data);
                 upstream_body
                     .flow_control()
@@ -736,10 +1000,13 @@ async fn handle_stream(
 
         // Update content-length to match (possibly redacted) body
         if client_response.headers().contains_key("content-length") {
-            client_response.headers_mut().insert(
-                http::header::CONTENT_LENGTH,
-                http::HeaderValue::from_str(&response_body_buf.len().to_string()).unwrap(),
-            );
+            // ASCII digits are always a valid HeaderValue.
+            #[allow(clippy::expect_used)]
+            let len_value = http::HeaderValue::from_str(&response_body_buf.len().to_string())
+                .expect("usize as decimal is valid header value");
+            let _ = client_response
+                .headers_mut()
+                .insert(http::header::CONTENT_LENGTH, len_value);
         }
 
         // Send buffered response
@@ -767,14 +1034,10 @@ async fn handle_stream(
             .send_response(client_response, upstream_body_is_end)
             .context("failed to send response to client")?;
 
-        // Create LLM metrics accumulator if this is a streaming messages response
-        let mut llm_acc = if is_llm_sse {
-            Some(llm::StreamingMetricsAccumulator::new())
-        } else {
-            None
-        };
-
         // Stream body chunks, only capturing for logging when log_dir is set
+        // — except for non-2xx responses, where we always keep a small leading
+        // excerpt so `record_summary` can surface the error body in the journal.
+        let needs_excerpt = (400..600).contains(&response_status);
         let mut response_body_buf = Vec::new();
         let mut response_body_len: usize = 0;
         if !upstream_body_is_end {
@@ -783,10 +1046,10 @@ async fn handle_stream(
                 response_body_len += data.len();
                 if needs_body_capture {
                     response_body_buf.extend_from_slice(&data);
-                }
-                // Feed to LLM metrics accumulator
-                if let Some(ref mut acc) = llm_acc {
-                    acc.process_chunk(&data);
+                } else if needs_excerpt && response_body_buf.len() < request::NON_2XX_EXCERPT_CAP {
+                    let take =
+                        (request::NON_2XX_EXCERPT_CAP - response_body_buf.len()).min(data.len());
+                    response_body_buf.extend_from_slice(&data[..take]);
                 }
                 // Release flow control capacity
                 upstream_body
@@ -815,11 +1078,6 @@ async fn handle_stream(
             }
         }
 
-        // Emit LLM metrics after stream completes
-        if let Some(acc) = llm_acc {
-            acc.emit(&host, &path, Some(&state.llm_metrics));
-        }
-
         (response_body_buf, response_body_len)
     };
 
@@ -842,6 +1100,7 @@ async fn handle_stream(
     };
     outcome.record_span(&request_span);
     outcome.record_metrics(&state.metrics);
+    outcome.record_summary();
     outcome.log_exchange(&state.log_dir).await;
 
     Ok(())
@@ -882,6 +1141,6 @@ fn inject_credentials_h2(headers: &mut HeaderMap, host: &str, state: &ProxyState
             .credential_injections_total
             .with_label_values(&[replacement.credential_name.as_str(), host])
             .inc();
-        headers.insert(name, replacement.value);
+        let _ = headers.insert(name, replacement.value);
     }
 }

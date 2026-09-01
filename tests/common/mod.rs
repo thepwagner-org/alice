@@ -1,5 +1,13 @@
 //! Shared test infrastructure for integration tests and benchmarks.
 #![allow(dead_code)]
+// Tests print progress, panic on failure (unwrap/expect), and discard handles.
+#![allow(
+    clippy::print_stdout,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    unused_results
+)]
 
 use std::sync::{Arc, Once};
 use std::time::Duration;
@@ -248,6 +256,7 @@ async fn handle_sse() -> impl IntoResponse {
 ///     ..Default::default()
 /// }
 /// ```
+#[derive(Default)]
 pub struct ProxyConfig {
     pub listen_port: u16,
     pub rules: Vec<RuleSpec>,
@@ -259,23 +268,8 @@ pub struct ProxyConfig {
     pub dns_hosts: Vec<(&'static str, &'static str)>,
     /// Optional metrics endpoint port (plain HTTP)
     pub metrics_port: Option<u16>,
-    /// Raw TOML snippets for [[transforms]] sections
-    pub transforms_toml: Vec<String>,
-}
-
-impl Default for ProxyConfig {
-    fn default() -> Self {
-        Self {
-            listen_port: 0,
-            rules: Vec::new(),
-            auth: None,
-            upstream_ca_pem: None,
-            credentials_toml: Vec::new(),
-            dns_hosts: Vec::new(),
-            metrics_port: None,
-            transforms_toml: Vec::new(),
-        }
-    }
+    /// Override the default idle timeout (seconds). None = use alice's default.
+    pub idle_timeout_secs: Option<u64>,
 }
 
 pub struct RuleSpec {
@@ -353,6 +347,10 @@ password_env = "ALICE_TEST_PASSWORD"
         ));
     }
 
+    if let Some(secs) = config.idle_timeout_secs {
+        toml.push_str(&format!("idle_timeout_secs = {}\n", secs));
+    }
+
     toml.push_str(&format!(
         r#"
 [ca]
@@ -406,11 +404,6 @@ host_cert_validity_hours = 1
         ));
     }
 
-    // Append raw transforms TOML
-    for transform_toml in &config.transforms_toml {
-        toml.push_str(transform_toml);
-    }
-
     std::fs::write(&config_path, &toml).expect("write config");
 
     // Set password env var if auth configured
@@ -440,156 +433,6 @@ host_cert_validity_hours = 1
     }
 
     handle
-}
-
-// ============================================================================
-// LLM Mock Server Fixtures
-// ============================================================================
-
-/// SSE fixture: text-only response (claude-haiku-4-5-20251001)
-pub const LLM_SSE_TEXT_ONLY: &str = concat!(
-    "event: message_start\n",
-    "data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-haiku-4-5-20251001\",",
-    "\"id\":\"msg_01JRyBAYDgNaozQXrghxWu9G\",\"type\":\"message\",\"role\":\"assistant\",",
-    "\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,",
-    "\"usage\":{\"input_tokens\":291,\"cache_creation_input_tokens\":0,",
-    "\"cache_read_input_tokens\":0,\"output_tokens\":1}}}\n\n",
-    "event: content_block_start\n",
-    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
-    "event: ping\n",
-    "data: {\"type\": \"ping\"}\n\n",
-    "event: content_block_delta\n",
-    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello world\"}}\n\n",
-    "event: content_block_stop\n",
-    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
-    "event: message_delta\n",
-    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},",
-    "\"usage\":{\"input_tokens\":291,\"output_tokens\":14}}\n\n",
-    "event: message_stop\n",
-    "data: {\"type\":\"message_stop\"}\n\n",
-);
-
-/// SSE fixture: single tool call (Bash: cargo fmt --check)
-pub const LLM_SSE_SINGLE_TOOL: &str = concat!(
-    "event: message_start\n",
-    "data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-opus-4-6\",",
-    "\"id\":\"msg_013DqEcVD4B1bL3DYtyNAD7L\",\"type\":\"message\",\"role\":\"assistant\",",
-    "\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,",
-    "\"usage\":{\"input_tokens\":3,\"cache_creation_input_tokens\":60,",
-    "\"cache_read_input_tokens\":21612,\"output_tokens\":1}}}\n\n",
-    "event: content_block_start\n",
-    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":",
-    "{\"type\":\"tool_use\",\"id\":\"toolu_01XGoNan4g2EDv5xp63jCmXB\",\"name\":\"Bash\",\"input\":{}}}\n\n",
-    "event: ping\n",
-    "data: {\"type\": \"ping\"}\n\n",
-    "event: content_block_delta\n",
-    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\"}}\n\n",
-    "event: content_block_delta\n",
-    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\": \"}}\n\n",
-    "event: content_block_delta\n",
-    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"cargo fmt --check\"}}\n\n",
-    "event: content_block_delta\n",
-    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\" 2>&1\\\"\"}}\n\n",
-    "event: content_block_delta\n",
-    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\", \\\"description\\\": \\\"Check formatting\\\"}\"}}\n\n",
-    "event: content_block_stop\n",
-    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
-    "event: message_delta\n",
-    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},",
-    "\"usage\":{\"input_tokens\":3,\"output_tokens\":78}}\n\n",
-    "event: message_stop\n",
-    "data: {\"type\":\"message_stop\"}\n\n",
-);
-
-/// Build an Axum router with a `/v1/messages` endpoint that echoes the request body.
-/// Used for testing system prompt injection — the test can inspect the body the proxy forwarded.
-pub fn echo_router() -> Router {
-    use axum::body::Body;
-    use axum::response::IntoResponse;
-    use axum::routing::{get, post};
-    use http_body_util::BodyExt;
-
-    Router::new()
-        .route("/get", get(|| async { "GET response" }))
-        .route(
-            "/v1/messages",
-            post(|req: axum::http::Request<Body>| async move {
-                let body_bytes = req.into_body().collect().await.unwrap().to_bytes();
-                (
-                    axum::http::StatusCode::OK,
-                    [("content-type", "application/json")],
-                    body_bytes,
-                )
-                    .into_response()
-            }),
-        )
-}
-
-/// Build an Axum router that includes a mock `/v1/messages` endpoint serving SSE.
-///
-/// The SSE data is delivered in small chunks with delays to simulate real streaming.
-pub fn llm_router(sse_fixture: &'static str) -> Router {
-    use axum::body::Body;
-    use axum::response::IntoResponse;
-    use axum::routing::{get, post};
-    use tokio::sync::mpsc;
-    use tokio_stream::wrappers::ReceiverStream;
-
-    Router::new()
-        .route("/get", get(|| async { "GET response" }))
-        .route(
-            "/headers",
-            get(|req: axum::http::Request<axum::body::Body>| async move {
-                let headers: Vec<String> = req
-                    .headers()
-                    .iter()
-                    .map(|(k, v)| format!("{}: {}", k, v.to_str().unwrap_or("?")))
-                    .collect();
-                headers.join("\n")
-            }),
-        )
-        .route(
-            "/v1/messages",
-            post(move || async move {
-                let (tx, rx) = mpsc::channel::<Result<String, std::io::Error>>(32);
-
-                tokio::spawn(async move {
-                    // Split SSE fixture into lines and send them in small groups
-                    // with delays to simulate real streaming behavior
-                    let mut buf = String::new();
-                    for line in sse_fixture.lines() {
-                        buf.push_str(line);
-                        buf.push('\n');
-
-                        // Send after each blank line (end of SSE event)
-                        if line.is_empty() {
-                            if tx.send(Ok(buf.clone())).await.is_err() {
-                                break;
-                            }
-                            buf.clear();
-                            // Small delay between events
-                            tokio::time::sleep(Duration::from_millis(5)).await;
-                        }
-                    }
-                    // Send any remaining data
-                    if !buf.is_empty() {
-                        let _ = tx.send(Ok(buf)).await;
-                    }
-                });
-
-                let stream = ReceiverStream::new(rx);
-                let body = Body::from_stream(stream);
-                (
-                    axum::http::StatusCode::OK,
-                    [
-                        ("content-type", "text/event-stream"),
-                        ("cache-control", "no-cache"),
-                    ],
-                    body,
-                )
-                    .into_response()
-            }),
-        )
 }
 
 // ============================================================================

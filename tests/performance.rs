@@ -8,6 +8,15 @@
 //! Connection and throughput tests compare direct vs proxy paths to quantify
 //! overhead. H2 concurrent stream tests are stress/correctness checks.
 
+// Tests print progress, panic on failure (unwrap/expect), and discard handles.
+#![allow(
+    clippy::print_stdout,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    unused_results
+)]
+
 mod common;
 
 use common::{
@@ -470,10 +479,10 @@ async fn perf_h2_concurrent_streams() {
     for i in 0..num_streams {
         let client = client.clone();
         let url = format!(
-            "https://localhost:{}/index/{}/{}",
+            "https://localhost:{}/index/{}/crate-{}",
             upstream_port,
             &["ab", "cd", "ef", "gh", "ij", "kl", "mn"][i % 7],
-            format!("crate-{}", i)
+            i
         );
 
         join_set.spawn(async move {
@@ -645,10 +654,10 @@ async fn perf_h2_concurrent_streams_slow_cdn() {
     for i in 0..num_streams {
         let client = client.clone();
         let url = format!(
-            "https://localhost:{}/index/{}/{}",
+            "https://localhost:{}/index/{}/crate-{}",
             upstream_port,
             &["ab", "cd", "ef", "gh", "ij", "kl", "mn"][i % 7],
-            format!("crate-{}", i)
+            i
         );
 
         join_set.spawn(async move {

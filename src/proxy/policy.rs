@@ -30,8 +30,9 @@ pub struct PolicyDecision {
     pub rule_index: usize,
     /// True if this rule has a path pattern that wasn't evaluated yet
     pub needs_path_check: bool,
-    /// True if this rule has redact_paths configured (requires full request inspection)
-    pub has_redact_paths: bool,
+    /// True if the matched rule has redact_paths configured, so full request
+    /// inspection is required to evaluate the path against them
+    pub requires_redact_inspection: bool,
     /// True if the matched path is in the rule's redact_paths list
     pub redact_tokens: bool,
 }
@@ -159,7 +160,7 @@ impl PolicyEngine {
             };
 
             if matches {
-                let (needs_path_check, has_redact_paths) = match &rule.pattern {
+                let (needs_path_check, requires_redact_inspection) = match &rule.pattern {
                     CompiledPattern::Host {
                         path_matcher,
                         redact_paths,
@@ -172,7 +173,7 @@ impl PolicyEngine {
                     action: rule.action,
                     rule_index: i,
                     needs_path_check,
-                    has_redact_paths,
+                    requires_redact_inspection,
                     // Can't determine redact_tokens without path
                     redact_tokens: false,
                 };
@@ -184,7 +185,7 @@ impl PolicyEngine {
             action: Action::Deny,
             rule_index: usize::MAX,
             needs_path_check: false,
-            has_redact_paths: false,
+            requires_redact_inspection: false,
             redact_tokens: false,
         }
     }
@@ -198,7 +199,7 @@ impl PolicyEngine {
         resolved_ips: Option<&[IpAddr]>,
     ) -> PolicyDecision {
         for (i, rule) in self.rules.iter().enumerate() {
-            let (matches, redact_tokens) = match &rule.pattern {
+            let (matches, redact_tokens, requires_redact_inspection) = match &rule.pattern {
                 CompiledPattern::Host {
                     host_matcher,
                     path_matcher,
@@ -218,14 +219,14 @@ impl PolicyEngine {
                     // Check if path matches any redact_paths pattern
                     let should_redact = redact_paths.iter().any(|rp| rp.is_match(path));
 
-                    (true, should_redact)
+                    (true, should_redact, !redact_paths.is_empty())
                 }
                 CompiledPattern::Cidr { network } => {
                     // CIDR rules match regardless of path, no token redaction
                     let matches = resolved_ips
                         .map(|ips| ips.iter().any(|ip| network.contains(ip)))
                         .unwrap_or(false);
-                    (matches, false)
+                    (matches, false, false)
                 }
             };
 
@@ -234,7 +235,7 @@ impl PolicyEngine {
                     action: rule.action,
                     rule_index: i,
                     needs_path_check: false,
-                    has_redact_paths: redact_tokens, // If we matched a redact path, the rule had redact_paths
+                    requires_redact_inspection,
                     redact_tokens,
                 };
             }
@@ -245,7 +246,7 @@ impl PolicyEngine {
             action: Action::Deny,
             rule_index: usize::MAX,
             needs_path_check: false,
-            has_redact_paths: false,
+            requires_redact_inspection: false,
             redact_tokens: false,
         }
     }

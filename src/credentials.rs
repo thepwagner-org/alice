@@ -8,15 +8,28 @@
 //! For SOPS-encrypted secrets, use `sops exec-env` to decrypt and pass as env vars:
 //!   sops exec-env secrets.yaml -- alice -c config.toml
 
+// Lock unwraps panic only on poisoning (another thread panicked while holding it),
+// at which point propagating the panic is the correct response.
+#![allow(clippy::unwrap_used)]
+
 use crate::config::{Credential, CredentialScheme};
+use crate::sanctum_proto::sanctum_client::SanctumClient;
+use crate::sanctum_proto::GetAccessTokenRequest;
 use anyhow::{bail, Context, Result};
 use base64::prelude::*;
 use globset::{Glob, GlobMatcher};
 use http::{HeaderName, HeaderValue};
+use hyper_util::rt::TokioIo;
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::Value;
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::RwLock;
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
+use tokio::net::UnixStream;
+use tonic::transport::{Channel, Endpoint, Uri};
+use tower::service_fn;
 use tracing::{debug, info, warn};
 
 /// Result of a successful credential replacement.
@@ -51,8 +64,10 @@ struct ResolvedCredential {
     header: HeaderName,
     /// Dummy token to match against (only replace if header equals this)
     match_value: HeaderValue,
-    /// Pre-formatted real value to inject
-    real_value: SecretString,
+    /// Pre-formatted real value to inject. Wrapped in Arc<RwLock<>> so a
+    /// sanctum refresh task can update it in place without disturbing
+    /// the outer credentials list.
+    real_value: Arc<RwLock<SecretString>>,
 }
 
 impl std::fmt::Debug for ResolvedCredential {
@@ -66,30 +81,88 @@ impl std::fmt::Debug for ResolvedCredential {
     }
 }
 
+/// Dynamic credentials captured from intercepted OAuth responses.
+///
+/// Bounded by keying on `(host_identity, token_type)`: a refreshed token for
+/// the same host and token type overwrites the prior entry rather than
+/// appending, so a long-lived proxy doesn't accumulate stale credentials.
+#[derive(Default)]
+struct DynamicStore {
+    /// Keyed by the dummy match value so `replace` is an O(1) lookup on the
+    /// hot request path rather than a linear scan over every token ever seen.
+    by_dummy: HashMap<HeaderValue, ResolvedCredential>,
+    /// Maps `(host_identity, token_type)` to the dummy currently representing
+    /// it, so a refresh can evict the prior dummy from `by_dummy`. This is
+    /// what keeps the store bounded to the number of distinct host/token
+    /// pairs in flight.
+    current: HashMap<(String, String), HeaderValue>,
+}
+
 /// Store for all loaded credentials.
 ///
 /// Thread-safe to support dynamic credential insertion from intercepted responses.
 pub struct CredentialStore {
-    credentials: RwLock<Vec<ResolvedCredential>>,
+    /// Static credentials from config. Fixed at load time and small, so the
+    /// linear scan in `replace` / `has_credentials_for_host` is bounded by the
+    /// config size.
+    static_creds: Vec<ResolvedCredential>,
+    /// Dynamic credentials captured at runtime; bounded and indexed for O(1)
+    /// lookup (see `DynamicStore`).
+    dynamic: RwLock<DynamicStore>,
     /// Counter for generating unique dummy token names
     token_counter: AtomicU64,
+    /// Sanctum refresh tasks queued at load time, drained by
+    /// `start_sanctum_refresh`. Each task owns the Arc<RwLock>
+    /// of a credential's `real_value` and updates it on a timer.
+    pending_sanctum_tasks: Mutex<Vec<SanctumTask>>,
 }
 
 impl CredentialStore {
     /// Load credentials from config.
     pub fn load(credentials: &[Credential]) -> Result<Self> {
         let mut resolved = Vec::new();
+        let mut sanctum_tasks = Vec::new();
 
         for cred in credentials {
-            resolved.push(resolve_credential(cred)?);
+            let (rc, maybe_task) = resolve_credential(cred)?;
+            resolved.push(rc);
+            if let Some(task) = maybe_task {
+                sanctum_tasks.push(task);
+            }
         }
 
-        debug!(count = resolved.len(), "loaded credentials");
+        debug!(
+            count = resolved.len(),
+            sanctum = sanctum_tasks.len(),
+            "loaded credentials"
+        );
 
         Ok(Self {
-            credentials: RwLock::new(resolved),
+            static_creds: resolved,
+            dynamic: RwLock::new(DynamicStore::default()),
             token_counter: AtomicU64::new(1),
+            pending_sanctum_tasks: Mutex::new(sanctum_tasks),
         })
+    }
+
+    /// Perform an initial fetch for any sanctum credentials and spawn
+    /// background refresh tasks. Must be called once after `load`, before
+    /// serving traffic, so the stored `real_value` is populated. Subsequent
+    /// calls are no-ops.
+    pub async fn start_sanctum_refresh(&self) -> Result<()> {
+        let tasks = {
+            let mut pending = self.pending_sanctum_tasks.lock().unwrap();
+            std::mem::take(&mut *pending)
+        };
+
+        if tasks.is_empty() {
+            return Ok(());
+        }
+
+        for task in tasks {
+            task.start().await?;
+        }
+        Ok(())
     }
 
     /// Check if a header should be replaced.
@@ -104,19 +177,19 @@ impl CredentialStore {
         header: &HeaderName,
         current_value: &HeaderValue,
     ) -> Option<Replacement> {
-        let credentials = self.credentials.read().unwrap();
-        for cred in credentials.iter() {
-            if cred.host_match.matches(host)
-                && cred.header == *header
-                && cred.match_value == *current_value
-            {
-                // Convert secret to HeaderValue
-                if let Ok(value) = HeaderValue::from_str(cred.real_value.expose_secret()) {
-                    return Some(Replacement {
-                        value,
-                        credential_name: cred.name.clone(),
-                    });
-                }
+        // Static credentials match by glob host pattern, so they require a
+        // scan — but the set is fixed at load and small.
+        for cred in &self.static_creds {
+            if let Some(replacement) = try_replace(cred, host, header, current_value) {
+                return Some(replacement);
+            }
+        }
+        // Dynamic credentials are keyed by the dummy value, so this is an O(1)
+        // lookup rather than a scan over every token ever captured.
+        let dynamic = self.dynamic.read().unwrap();
+        if let Some(cred) = dynamic.by_dummy.get(current_value) {
+            if let Some(replacement) = try_replace(cred, host, header, current_value) {
+                return Some(replacement);
             }
         }
         None
@@ -124,15 +197,26 @@ impl CredentialStore {
 
     /// Check if any credentials are configured for a given host.
     pub fn has_credentials_for_host(&self, host: &str) -> bool {
-        let credentials = self.credentials.read().unwrap();
-        credentials.iter().any(|cred| cred.host_match.matches(host))
+        if self
+            .static_creds
+            .iter()
+            .any(|cred| cred.host_match.matches(host))
+        {
+            return true;
+        }
+        // Dynamic set is bounded to distinct host/token pairs, so this scan is
+        // not linear in the number of historical credentials.
+        let dynamic = self.dynamic.read().unwrap();
+        dynamic
+            .by_dummy
+            .values()
+            .any(|cred| cred.host_match.matches(host))
     }
 
     /// Returns true if no credentials are loaded.
     #[allow(dead_code)] // May be useful for future features
     pub fn is_empty(&self) -> bool {
-        let credentials = self.credentials.read().unwrap();
-        credentials.is_empty()
+        self.static_creds.is_empty() && self.dynamic.read().unwrap().by_dummy.is_empty()
     }
 
     /// Insert a dynamic credential from an intercepted OAuth response.
@@ -169,25 +253,36 @@ impl CredentialStore {
             HostMatch::Exact(host.to_string())
         };
 
-        let match_desc = host_pattern.unwrap_or(host);
+        // The host identity (glob pattern if present, else the exact host)
+        // plus the token type form the eviction key: a refresh for the same
+        // pair overwrites the prior dummy instead of appending.
+        let host_identity = host_pattern.unwrap_or(host).to_string();
+        let match_value = HeaderValue::from_str(&dummy_with_bearer).unwrap();
 
         let cred = ResolvedCredential {
             name: format!("dynamic-{}-{}", token_type, id),
             host_match,
             header: HeaderName::from_static("authorization"),
-            match_value: HeaderValue::from_str(&dummy_with_bearer).unwrap(),
-            real_value: SecretString::new(real_with_bearer.into()),
+            match_value: match_value.clone(),
+            real_value: Arc::new(RwLock::new(SecretString::new(real_with_bearer.into()))),
         };
 
         debug!(
-            host = %match_desc,
+            host = %host_identity,
             token_type = %token_type,
             dummy = %dummy,
             "captured token from response"
         );
 
-        let mut credentials = self.credentials.write().unwrap();
-        credentials.push(cred);
+        let key = (host_identity, token_type.to_string());
+        let mut dynamic = self.dynamic.write().unwrap();
+        // Evict the prior dummy for this host/token pair so the store stays
+        // bounded; the stale dummy would never be presented again anyway.
+        let previous = dynamic.current.insert(key, match_value.clone());
+        if let Some(old_dummy) = previous {
+            let _ = dynamic.by_dummy.remove(&old_dummy);
+        }
+        let _ = dynamic.by_dummy.insert(match_value, cred);
 
         dummy
     }
@@ -232,21 +327,21 @@ impl CredentialStore {
         // Redact access_token
         if let Some(Value::String(token)) = obj.get("access_token") {
             let dummy = self.insert_dynamic(host, "access", token, host_pattern);
-            obj.insert("access_token".to_string(), Value::String(dummy));
+            let _ = obj.insert("access_token".to_string(), Value::String(dummy));
             redacted_any = true;
         }
 
         // Redact refresh_token
         if let Some(Value::String(token)) = obj.get("refresh_token") {
             let dummy = self.insert_dynamic(host, "refresh", token, host_pattern);
-            obj.insert("refresh_token".to_string(), Value::String(dummy));
+            let _ = obj.insert("refresh_token".to_string(), Value::String(dummy));
             redacted_any = true;
         }
 
         // Redact id_token (OpenID Connect)
         if let Some(Value::String(token)) = obj.get("id_token") {
             let dummy = self.insert_dynamic(host, "id", token, host_pattern);
-            obj.insert("id_token".to_string(), Value::String(dummy));
+            let _ = obj.insert("id_token".to_string(), Value::String(dummy));
             redacted_any = true;
         }
 
@@ -266,45 +361,66 @@ impl CredentialStore {
     }
 }
 
-/// Resolve a credential from the main config file (env or file source).
-fn resolve_credential(cred: &Credential) -> Result<ResolvedCredential> {
-    // Validate: exactly one of env or file must be specified
-    match (&cred.env, &cred.file) {
-        (Some(_), Some(_)) => bail!(
-            "credential '{}': cannot specify both 'env' and 'file'",
+/// Build a `Replacement` if `cred` matches the request's host, header, and
+/// current (dummy) value. Shared by the static-scan and dynamic-lookup paths.
+fn try_replace(
+    cred: &ResolvedCredential,
+    host: &str,
+    header: &HeaderName,
+    current_value: &HeaderValue,
+) -> Option<Replacement> {
+    if cred.host_match.matches(host) && cred.header == *header && cred.match_value == *current_value
+    {
+        let secret = cred.real_value.read().unwrap();
+        if let Ok(value) = HeaderValue::from_str(secret.expose_secret()) {
+            return Some(Replacement {
+                value,
+                credential_name: cred.name.clone(),
+            });
+        }
+    }
+    None
+}
+
+/// Resolve a credential from the main config file (env, file, or sanctum
+/// source). For sanctum credentials, returns a placeholder
+/// `ResolvedCredential` plus a `SanctumTask` that the caller must start.
+fn resolve_credential(cred: &Credential) -> Result<(ResolvedCredential, Option<SanctumTask>)> {
+    // Validate: exactly one of env, file, or sanctum_path must be specified
+    let source_count = [
+        cred.env.is_some(),
+        cred.file.is_some(),
+        cred.sanctum_path.is_some(),
+    ]
+    .iter()
+    .filter(|b| **b)
+    .count();
+    if source_count == 0 {
+        bail!(
+            "credential '{}': must specify one of 'env', 'file', or 'sanctum_path'",
             cred.name
-        ),
-        (None, None) => bail!(
-            "credential '{}': must specify either 'env' or 'file'",
+        );
+    }
+    if source_count > 1 {
+        bail!(
+            "credential '{}': must specify only one of 'env', 'file', or 'sanctum_path'",
             cred.name
-        ),
-        _ => {}
+        );
+    }
+    if cred.refresh_interval_secs.is_some() && cred.sanctum_path.is_none() {
+        bail!(
+            "credential '{}': 'refresh_interval_secs' is only valid with 'sanctum_path'",
+            cred.name
+        );
+    }
+    if cred.sanctum_name.is_some() && cred.sanctum_path.is_none() {
+        bail!(
+            "credential '{}': 'sanctum_name' is only valid with 'sanctum_path'",
+            cred.name
+        );
     }
 
-    // Load the secret value
-    let secret_value = if let Some(env_var) = &cred.env {
-        std::env::var(env_var).with_context(|| {
-            format!(
-                "credential '{}': environment variable '{}' not set",
-                cred.name, env_var
-            )
-        })?
-    } else if let Some(file_path) = &cred.file {
-        std::fs::read_to_string(file_path)
-            .with_context(|| {
-                format!(
-                    "credential '{}': failed to read file '{}'",
-                    cred.name,
-                    file_path.display()
-                )
-            })?
-            .trim()
-            .to_string()
-    } else {
-        unreachable!()
-    };
-
-    // Compile the host matcher (shared by both schemes)
+    // Compile the host matcher (shared by all schemes)
     let host_glob = Glob::new(&cred.host).with_context(|| {
         format!(
             "credential '{}': invalid host pattern '{}'",
@@ -312,10 +428,70 @@ fn resolve_credential(cred: &Credential) -> Result<ResolvedCredential> {
         )
     })?;
 
-    // Branch on scheme
-    let (header, match_value, real_value) = match cred.scheme {
-        CredentialScheme::Custom => resolve_custom_credential(cred, &secret_value)?,
-        CredentialScheme::Basic => resolve_basic_credential(cred, &secret_value)?,
+    // For env/file we resolve the secret now; for sanctum we use an
+    // empty placeholder and let the refresh task fill it on first fetch.
+    let (header, match_value, real_value, sanctum_task) = if let Some(socket) = &cred.sanctum_path {
+        // sanctum only supports custom-scheme header injection (Bearer
+        // tokens). Basic auth via a refresher doesn't have a real use case.
+        if cred.scheme != CredentialScheme::Custom {
+            bail!(
+                "credential '{}': scheme = 'basic' is not supported with 'sanctum_path'",
+                cred.name
+            );
+        }
+        let (header, match_value, format_str) = sanctum_header_and_format(cred)?;
+        let interval = cred.refresh_interval_secs.unwrap_or(60);
+        if interval == 0 {
+            bail!(
+                "credential '{}': 'refresh_interval_secs' must be positive",
+                cred.name
+            );
+        }
+        let slot_name = cred.sanctum_name.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "credential '{}': 'sanctum_name' is required with 'sanctum_path'",
+                cred.name
+            )
+        })?;
+        let real_value = Arc::new(RwLock::new(SecretString::new(String::new().into())));
+        let task = SanctumTask {
+            name: cred.name.clone(),
+            socket: socket.clone(),
+            slot_name,
+            interval: Duration::from_secs(interval),
+            format: format_str,
+            real_value: Arc::clone(&real_value),
+        };
+        (header, match_value, real_value, Some(task))
+    } else {
+        let secret_value = if let Some(env_var) = &cred.env {
+            std::env::var(env_var).with_context(|| {
+                format!(
+                    "credential '{}': environment variable '{}' not set",
+                    cred.name, env_var
+                )
+            })?
+        } else if let Some(file_path) = &cred.file {
+            std::fs::read_to_string(file_path)
+                .with_context(|| {
+                    format!(
+                        "credential '{}': failed to read file '{}'",
+                        cred.name,
+                        file_path.display()
+                    )
+                })?
+                .trim()
+                .to_string()
+        } else {
+            unreachable!("source_count guarantees one source is set")
+        };
+
+        let (header, match_value, real_value) = match cred.scheme {
+            CredentialScheme::Custom => resolve_custom_credential(cred, &secret_value)?,
+            CredentialScheme::Basic => resolve_basic_credential(cred, &secret_value)?,
+        };
+        let real_value = Arc::new(RwLock::new(SecretString::new(real_value.into())));
+        (header, match_value, real_value, None)
     };
 
     let header_display = header.as_str();
@@ -324,16 +500,53 @@ fn resolve_credential(cred: &Credential) -> Result<ResolvedCredential> {
         host = %cred.host,
         header = %header_display,
         scheme = ?cred.scheme,
+        sanctum = cred.sanctum_path.is_some(),
         "loaded credential"
     );
 
-    Ok(ResolvedCredential {
-        name: cred.name.clone(),
-        host_match: HostMatch::Glob(host_glob.compile_matcher()),
-        header,
-        match_value,
-        real_value: SecretString::new(real_value.into()),
-    })
+    Ok((
+        ResolvedCredential {
+            name: cred.name.clone(),
+            host_match: HostMatch::Glob(host_glob.compile_matcher()),
+            header,
+            match_value,
+            real_value,
+        },
+        sanctum_task,
+    ))
+}
+
+/// Validate header-related fields for a sanctum credential and return
+/// `(header, match_value, format_string)`. The format string is retained so
+/// the refresh task can re-render the header when the access_token changes.
+fn sanctum_header_and_format(cred: &Credential) -> Result<(HeaderName, HeaderValue, String)> {
+    if cred.username.is_some() {
+        bail!(
+            "credential '{}': 'username' cannot be set with 'sanctum_path'",
+            cred.name
+        );
+    }
+
+    let header_str = cred.header.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "credential '{}': 'header' is required with 'sanctum_path'",
+            cred.name
+        )
+    })?;
+    let header = header_str.parse::<HeaderName>().with_context(|| {
+        format!(
+            "credential '{}': invalid header name '{}'",
+            cred.name, header_str
+        )
+    })?;
+    let match_value = HeaderValue::from_str(&cred.match_value).with_context(|| {
+        format!(
+            "credential '{}': invalid match value '{}'",
+            cred.name, cred.match_value
+        )
+    })?;
+    let format_str = cred.format.as_deref().unwrap_or("{value}").to_string();
+    Ok((header, match_value, format_str))
 }
 
 /// Resolve a custom-scheme credential (backward-compatible path).
@@ -429,6 +642,131 @@ fn resolve_basic_credential(
     Ok((header, match_value, real_value))
 }
 
+/// Background refresher for a sanctum credential. Owns a shared handle
+/// to the credential's `real_value`; periodically calls
+/// `Sanctum.GetAccessToken` over gRPC (UDS), formats the returned token via
+/// `format`, and writes the result into the shared slot. Refresh failures
+/// log and keep the prior value.
+struct SanctumTask {
+    name: String,
+    /// Path to the sanctum Unix domain socket (e.g. `/run/sanctum/sanctum.sock`).
+    socket: PathBuf,
+    /// Vault slot name on the broker (passed in `GetAccessTokenRequest.name`).
+    slot_name: String,
+    interval: Duration,
+    format: String,
+    real_value: Arc<RwLock<SecretString>>,
+}
+
+impl std::fmt::Debug for SanctumTask {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SanctumTask")
+            .field("name", &self.name)
+            .field("socket", &self.socket)
+            .field("slot_name", &self.slot_name)
+            .field("interval", &self.interval)
+            .finish()
+    }
+}
+
+impl SanctumTask {
+    /// Connect over UDS, perform the initial fetch (failing loudly so the
+    /// proxy doesn't start against a missing or empty broker), then spawn a
+    /// background tick that re-fetches every `interval`.
+    async fn start(self) -> Result<()> {
+        let mut client = sanctum_connect(&self.socket).await.with_context(|| {
+            format!(
+                "sanctum credential '{}': connect {}",
+                self.name,
+                self.socket.display()
+            )
+        })?;
+        let token = fetch_token(&mut client, &self.slot_name)
+            .await
+            .with_context(|| {
+                format!(
+                    "sanctum credential '{}': initial GetAccessToken(name={}) on {}",
+                    self.name,
+                    self.slot_name,
+                    self.socket.display()
+                )
+            })?;
+        let formatted = self.format.replace("{value}", &token);
+        {
+            let mut slot = self.real_value.write().unwrap();
+            *slot = SecretString::new(formatted.into());
+        }
+        info!(
+            name = %self.name,
+            slot = %self.slot_name,
+            socket = %self.socket.display(),
+            interval_secs = self.interval.as_secs(),
+            "sanctum credential primed; refresh loop spawned",
+        );
+
+        let _refresh = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(self.interval);
+            // First tick fires immediately; the initial fetch above already
+            // populated the slot, so consume it.
+            let _first = ticker.tick().await;
+            loop {
+                let _next = ticker.tick().await;
+                match fetch_token(&mut client, &self.slot_name).await {
+                    Ok(token) => {
+                        let formatted = self.format.replace("{value}", &token);
+                        let mut slot = self.real_value.write().unwrap();
+                        *slot = SecretString::new(formatted.into());
+                        debug!(name = %self.name, slot = %self.slot_name, "sanctum token refreshed");
+                    }
+                    Err(e) => {
+                        warn!(
+                            name = %self.name,
+                            slot = %self.slot_name,
+                            socket = %self.socket.display(),
+                            error = %e,
+                            "sanctum refresh failed; keeping prior token",
+                        );
+                    }
+                }
+            }
+        });
+        Ok(())
+    }
+}
+
+/// Open a tonic gRPC channel to a sanctum Unix domain socket. The URI is a
+/// dummy — the connector swallows it and dials the path instead.
+async fn sanctum_connect(socket: &std::path::Path) -> Result<SanctumClient<Channel>> {
+    let socket = socket.to_path_buf();
+    let endpoint: Endpoint =
+        Endpoint::try_from("http://[::]:50051").context("static sanctum URI is valid")?;
+    let channel = endpoint
+        .connect_with_connector(service_fn(move |_: Uri| {
+            let s = socket.clone();
+            async move {
+                let stream = UnixStream::connect(&s).await?;
+                Ok::<_, std::io::Error>(TokioIo::new(stream))
+            }
+        }))
+        .await
+        .context("sanctum UDS connect")?;
+    Ok(SanctumClient::new(channel))
+}
+
+async fn fetch_token(client: &mut SanctumClient<Channel>, slot_name: &str) -> Result<String> {
+    let resp = client
+        .get_access_token(GetAccessTokenRequest {
+            name: slot_name.to_string(),
+        })
+        .await
+        .context("GetAccessToken RPC")?;
+    let token = resp.into_inner().access_token;
+    if token.is_empty() {
+        bail!("sanctum returned empty access_token");
+    }
+    Ok(token)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -453,6 +791,9 @@ mod tests {
             username: None,
             env: env.map(|s| s.to_string()),
             file,
+            sanctum_path: None,
+            sanctum_name: None,
+            refresh_interval_secs: None,
         }
     }
 
@@ -475,7 +816,16 @@ mod tests {
             username: Some(username.to_string()),
             env: env.map(|s| s.to_string()),
             file,
+            sanctum_path: None,
+            sanctum_name: None,
+            refresh_interval_secs: None,
         }
+    }
+
+    /// Read a `ResolvedCredential`'s real_value as a String (test convenience;
+    /// the live code accesses it via the lock inside `replace`).
+    fn real_value(rc: &ResolvedCredential) -> String {
+        rc.real_value.read().unwrap().expose_secret().to_string()
     }
 
     // ========================================================================
@@ -496,13 +846,11 @@ mod tests {
             None,
         );
 
-        let resolved = resolve_credential(&cred).unwrap();
+        let (resolved, task) = resolve_credential(&cred).unwrap();
+        assert!(task.is_none());
         assert_eq!(resolved.name, "test");
         assert_eq!(resolved.header, "authorization");
-        assert_eq!(
-            resolved.real_value.expose_secret(),
-            "Bearer my-secret-value"
-        );
+        assert_eq!(real_value(&resolved), "Bearer my-secret-value");
 
         std::env::remove_var("TEST_CRED_SECRET");
     }
@@ -539,6 +887,9 @@ mod tests {
             username: None,
             env: Some("VAR".to_string()),
             file: Some("/path".into()),
+            sanctum_path: None,
+            sanctum_name: None,
+            refresh_interval_secs: None,
         };
 
         let result = resolve_credential(&cred);
@@ -546,7 +897,7 @@ mod tests {
         assert!(result
             .unwrap_err()
             .to_string()
-            .contains("cannot specify both"));
+            .contains("must specify only one of"));
     }
 
     #[test]
@@ -566,7 +917,7 @@ mod tests {
         assert!(result
             .unwrap_err()
             .to_string()
-            .contains("must specify either"));
+            .contains("must specify one of"));
     }
 
     #[test]
@@ -636,6 +987,45 @@ mod tests {
     }
 
     #[test]
+    fn test_dynamic_credential_overwrites_and_bounds_store() {
+        let store = CredentialStore::load(&[]).unwrap();
+        let header = HeaderName::from_static("authorization");
+
+        // Simulate repeated OAuth responses for the same host/token type.
+        let mut last_dummy = String::new();
+        for _ in 0..10 {
+            last_dummy = store.insert_dynamic("api.example.com", "access", "real-token", None);
+        }
+
+        // The store must not grow without bound: one entry per (host, type).
+        {
+            let dynamic = store.dynamic.read().unwrap();
+            assert_eq!(dynamic.by_dummy.len(), 1, "store grew past one entry");
+            assert_eq!(dynamic.current.len(), 1);
+        }
+
+        // The latest dummy resolves to the real token.
+        let latest = HeaderValue::from_str(&format!("Bearer {}", last_dummy)).unwrap();
+        let result = store.replace("api.example.com", &header, &latest);
+        assert_eq!(result.unwrap().value, "Bearer real-token");
+
+        // An earlier, evicted dummy no longer resolves.
+        let stale = HeaderValue::from_static("Bearer ALICE_ACCESS_1");
+        assert_ne!(latest, stale, "test expects the first dummy to differ");
+        assert!(store.replace("api.example.com", &header, &stale).is_none());
+
+        // A distinct token type for the same host adds a second bounded entry.
+        let _ = store.insert_dynamic("api.example.com", "refresh", "refresh-token", None);
+        {
+            let dynamic = store.dynamic.read().unwrap();
+            assert_eq!(dynamic.by_dummy.len(), 2);
+        }
+
+        assert!(store.has_credentials_for_host("api.example.com"));
+        assert!(!store.has_credentials_for_host("other.example.org"));
+    }
+
+    #[test]
     fn test_resolve_credential_from_file() {
         use std::io::Write;
 
@@ -653,11 +1043,12 @@ mod tests {
             Some(tmp.path().to_path_buf()),
         );
 
-        let resolved = resolve_credential(&cred).unwrap();
+        let (resolved, task) = resolve_credential(&cred).unwrap();
+        assert!(task.is_none());
         assert_eq!(resolved.name, "file-test");
         assert_eq!(resolved.header, "x-api-key");
         // Value should be trimmed
-        assert_eq!(resolved.real_value.expose_secret(), "file-secret-value");
+        assert_eq!(real_value(&resolved), "file-secret-value");
     }
 
     #[test]
@@ -695,10 +1086,13 @@ mod tests {
             username: None,
             env: Some("TEST_DEFAULT_FMT".to_string()),
             file: None,
+            sanctum_path: None,
+            sanctum_name: None,
+            refresh_interval_secs: None,
         };
 
-        let resolved = resolve_credential(&cred).unwrap();
-        assert_eq!(resolved.real_value.expose_secret(), "raw-secret");
+        let (resolved, _task) = resolve_credential(&cred).unwrap();
+        assert_eq!(real_value(&resolved), "raw-secret");
 
         std::env::remove_var("TEST_DEFAULT_FMT");
     }
@@ -717,6 +1111,9 @@ mod tests {
             username: Some("alice".to_string()), // not allowed for custom
             env: Some("TEST_CUSTOM_USER".to_string()),
             file: None,
+            sanctum_path: None,
+            sanctum_name: None,
+            refresh_interval_secs: None,
         };
 
         let result = resolve_credential(&cred);
@@ -746,7 +1143,8 @@ mod tests {
             None,
         );
 
-        let resolved = resolve_credential(&cred).unwrap();
+        let (resolved, task) = resolve_credential(&cred).unwrap();
+        assert!(task.is_none());
         assert_eq!(resolved.name, "basic-test");
         assert_eq!(resolved.header, "authorization");
 
@@ -756,7 +1154,7 @@ mod tests {
 
         // real_value should be: Basic base64("token:real-password")
         let expected_real = format!("Basic {}", BASE64_STANDARD.encode(b"token:real-password"));
-        assert_eq!(resolved.real_value.expose_secret(), &expected_real);
+        assert_eq!(real_value(&resolved), expected_real);
 
         std::env::remove_var("TEST_BASIC_SECRET");
     }
@@ -777,12 +1175,12 @@ mod tests {
             Some(tmp.path().to_path_buf()),
         );
 
-        let resolved = resolve_credential(&cred).unwrap();
+        let (resolved, _task) = resolve_credential(&cred).unwrap();
         assert_eq!(resolved.header, "authorization");
 
         // real_value should use trimmed password
         let expected_real = format!("Basic {}", BASE64_STANDARD.encode(b"deploy:file-password"));
-        assert_eq!(resolved.real_value.expose_secret(), &expected_real);
+        assert_eq!(real_value(&resolved), expected_real);
     }
 
     #[test]
@@ -799,6 +1197,9 @@ mod tests {
             username: None, // missing!
             env: Some("TEST_BASIC_NO_USER".to_string()),
             file: None,
+            sanctum_path: None,
+            sanctum_name: None,
+            refresh_interval_secs: None,
         };
 
         let result = resolve_credential(&cred);
@@ -825,6 +1226,9 @@ mod tests {
             username: Some("token".to_string()),
             env: Some("TEST_BASIC_HDR".to_string()),
             file: None,
+            sanctum_path: None,
+            sanctum_name: None,
+            refresh_interval_secs: None,
         };
 
         let result = resolve_credential(&cred);
@@ -851,6 +1255,9 @@ mod tests {
             username: Some("token".to_string()),
             env: Some("TEST_BASIC_FMT".to_string()),
             file: None,
+            sanctum_path: None,
+            sanctum_name: None,
+            refresh_interval_secs: None,
         };
 
         let result = resolve_credential(&cred);
@@ -961,5 +1368,230 @@ mod tests {
 
         std::env::remove_var("TEST_MIX_BEARER");
         std::env::remove_var("TEST_MIX_BASIC");
+    }
+
+    // ========================================================================
+    // Sanctum source tests
+    // ========================================================================
+
+    /// Helper to build a sanctum credential for tests.
+    fn sanctum_cred(
+        name: &str,
+        host: &str,
+        socket: &std::path::Path,
+        refresh_secs: Option<u64>,
+    ) -> Credential {
+        Credential {
+            name: name.to_string(),
+            host: host.to_string(),
+            scheme: CredentialScheme::Custom,
+            header: Some("Authorization".to_string()),
+            match_value: "Bearer sk-ant-oat01-AAAA".to_string(),
+            format: Some("Bearer {value}".to_string()),
+            username: None,
+            env: None,
+            file: None,
+            sanctum_path: Some(socket.to_path_buf()),
+            sanctum_name: Some("default".to_string()),
+            refresh_interval_secs: refresh_secs,
+        }
+    }
+
+    #[test]
+    fn test_sanctum_resolve_returns_pending_task() {
+        let cred = sanctum_cred(
+            "anthropic",
+            "api.anthropic.com",
+            std::path::Path::new("/run/sanctum/sanctum.sock"),
+            Some(60),
+        );
+        let (resolved, task) = resolve_credential(&cred).unwrap();
+        assert_eq!(resolved.name, "anthropic");
+        assert_eq!(resolved.header, "authorization");
+        assert_eq!(resolved.match_value, "Bearer sk-ant-oat01-AAAA");
+        // Real value starts empty; refresh task fills it.
+        assert_eq!(real_value(&resolved), "");
+        let task = task.unwrap();
+        assert_eq!(task.name, "anthropic");
+        assert_eq!(
+            task.socket,
+            std::path::Path::new("/run/sanctum/sanctum.sock")
+        );
+        assert_eq!(task.interval, Duration::from_secs(60));
+        assert_eq!(task.format, "Bearer {value}");
+    }
+
+    #[test]
+    fn test_sanctum_default_refresh_interval() {
+        let cred = sanctum_cred(
+            "anthropic",
+            "api.anthropic.com",
+            std::path::Path::new("/run/sanctum/sanctum.sock"),
+            None, // omitted — defaults to 60s
+        );
+        let (_resolved, task) = resolve_credential(&cred).unwrap();
+        assert_eq!(task.unwrap().interval, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn test_sanctum_rejects_zero_interval() {
+        let cred = sanctum_cred(
+            "anthropic",
+            "api.anthropic.com",
+            std::path::Path::new("/run/sanctum/sanctum.sock"),
+            Some(0),
+        );
+        let err = resolve_credential(&cred).unwrap_err().to_string();
+        assert!(err.contains("must be positive"));
+    }
+
+    #[test]
+    fn test_sanctum_conflicts_with_env() {
+        let mut cred = sanctum_cred(
+            "anthropic",
+            "api.anthropic.com",
+            std::path::Path::new("/run/sanctum/sanctum.sock"),
+            None,
+        );
+        cred.env = Some("ANTHROPIC_TOKEN".to_string());
+        let err = resolve_credential(&cred).unwrap_err().to_string();
+        assert!(err.contains("must specify only one of"));
+    }
+
+    #[test]
+    fn test_sanctum_conflicts_with_file() {
+        let mut cred = sanctum_cred(
+            "anthropic",
+            "api.anthropic.com",
+            std::path::Path::new("/run/sanctum/sanctum.sock"),
+            None,
+        );
+        cred.file = Some("/tmp/secret".into());
+        let err = resolve_credential(&cred).unwrap_err().to_string();
+        assert!(err.contains("must specify only one of"));
+    }
+
+    #[test]
+    fn test_refresh_interval_requires_sanctum() {
+        let mut cred = custom_cred(
+            "test",
+            "api.example.com",
+            "Authorization",
+            "Bearer DUMMY",
+            "Bearer {value}",
+            Some("UNSET_VAR_XYZ"),
+            None,
+        );
+        cred.refresh_interval_secs = Some(60);
+        let err = resolve_credential(&cred).unwrap_err().to_string();
+        assert!(err.contains("'refresh_interval_secs' is only valid"));
+    }
+
+    #[test]
+    fn test_sanctum_rejects_basic_scheme() {
+        let mut cred = sanctum_cred(
+            "anthropic",
+            "api.anthropic.com",
+            std::path::Path::new("/run/sanctum/sanctum.sock"),
+            None,
+        );
+        cred.scheme = CredentialScheme::Basic;
+        cred.header = None;
+        cred.username = Some("token".to_string());
+        cred.format = None;
+        let err = resolve_credential(&cred).unwrap_err().to_string();
+        assert!(err.contains("scheme = 'basic' is not supported"));
+    }
+
+    #[test]
+    fn test_sanctum_requires_header() {
+        let mut cred = sanctum_cred(
+            "anthropic",
+            "api.anthropic.com",
+            std::path::Path::new("/run/sanctum/sanctum.sock"),
+            None,
+        );
+        cred.header = None;
+        let err = resolve_credential(&cred).unwrap_err().to_string();
+        assert!(err.contains("'header' is required"));
+    }
+
+    /// End-to-end test: spin up a tonic server on a UDS that mimics sanctum,
+    /// load a credential pointing at it, run `start_sanctum_refresh`,
+    /// and assert that `replace()` injects the freshly fetched token.
+    #[tokio::test]
+    async fn test_sanctum_end_to_end() {
+        use crate::sanctum_proto::sanctum_server::{Sanctum, SanctumServer};
+        use crate::sanctum_proto::{
+            AccessToken, ForceRefreshRequest, GetAccessTokenRequest, ImportCredentialRequest,
+            ImportCredentialResponse,
+        };
+        use tokio::net::UnixListener;
+        use tokio_stream::wrappers::UnixListenerStream;
+        use tonic::transport::Server;
+        use tonic::{Request, Response, Status};
+
+        struct MockSanctum;
+        #[tonic::async_trait]
+        impl Sanctum for MockSanctum {
+            async fn get_access_token(
+                &self,
+                req: Request<GetAccessTokenRequest>,
+            ) -> Result<Response<AccessToken>, Status> {
+                assert_eq!(req.into_inner().name, "default");
+                Ok(Response::new(AccessToken {
+                    access_token: "sk-ant-oat01-REAL".to_string(),
+                    expires_at: None,
+                }))
+            }
+            async fn force_refresh(
+                &self,
+                _: Request<ForceRefreshRequest>,
+            ) -> Result<Response<AccessToken>, Status> {
+                Err(Status::unimplemented("mock"))
+            }
+            async fn import_credential(
+                &self,
+                _: Request<ImportCredentialRequest>,
+            ) -> Result<Response<ImportCredentialResponse>, Status> {
+                Err(Status::unimplemented("mock"))
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("sanctum.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let incoming = UnixListenerStream::new(listener);
+        let _server = tokio::spawn(async move {
+            Server::builder()
+                .add_service(SanctumServer::new(MockSanctum))
+                .serve_with_incoming(incoming)
+                .await
+                .unwrap();
+        });
+
+        let cred = sanctum_cred("anthropic", "api.anthropic.com", &socket_path, Some(60));
+        let store = CredentialStore::load(&[cred]).unwrap();
+        store.start_sanctum_refresh().await.unwrap();
+
+        let header = HeaderName::from_static("authorization");
+        let dummy = HeaderValue::from_static("Bearer sk-ant-oat01-AAAA");
+        let result = store.replace("api.anthropic.com", &header, &dummy);
+        let r = result.expect("replacement should fire");
+        assert_eq!(r.value, "Bearer sk-ant-oat01-REAL");
+        assert_eq!(r.credential_name, "anthropic");
+    }
+
+    #[tokio::test]
+    async fn test_sanctum_initial_fetch_failure_aborts() {
+        // Point at a path with nothing bound; first GetAccessToken must fail loud.
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("nope.sock");
+
+        let cred = sanctum_cred("anthropic", "api.anthropic.com", &socket_path, Some(60));
+        let store = CredentialStore::load(&[cred]).unwrap();
+        let err = store.start_sanctum_refresh().await.unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("sanctum credential 'anthropic'"));
     }
 }

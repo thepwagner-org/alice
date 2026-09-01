@@ -1,6 +1,7 @@
 use anyhow::Result;
-use hickory_resolver::config::{ResolverConfig, ResolverOpts};
-use hickory_resolver::TokioAsyncResolver;
+use hickory_resolver::config::{ResolverConfig, GOOGLE};
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
+use hickory_resolver::TokioResolver;
 use moka::future::Cache;
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -10,7 +11,7 @@ use tracing::debug;
 
 /// DNS resolver with caching, overrides, and CIDR validation
 pub struct DnsResolver {
-    resolver: TokioAsyncResolver,
+    resolver: TokioResolver,
     cache: Cache<String, Arc<Vec<IpAddr>>>,
     /// Static hostname overrides (like /etc/hosts), bypasses DNS
     overrides: HashMap<String, Vec<IpAddr>>,
@@ -22,8 +23,13 @@ impl DnsResolver {
         cache_max_entries: u64,
         overrides: HashMap<String, Vec<IpAddr>>,
     ) -> Result<Self> {
-        let resolver =
-            TokioAsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default());
+        // hickory 0.26 dropped `ResolverConfig::default()`; this is what it
+        // used to mean (Google public DNS over UDP with TCP fallback).
+        let resolver = TokioResolver::builder_with_config(
+            ResolverConfig::udp_and_tcp(&GOOGLE),
+            TokioRuntimeProvider::default(),
+        )
+        .build()?;
 
         let cache = Cache::builder()
             .max_capacity(cache_max_entries)

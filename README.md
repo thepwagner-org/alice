@@ -73,7 +73,7 @@ On top of credential injection, Alice enforces an **access control policy**: a d
    - Scoped by host pattern - credentials only injected for matching hosts
 - **Observability** - Structured JSON logging and distributed tracing
    - OpenTelemetry (OTLP) span export with per-request semantic conventions
-   - LLM usage parsing (Anthropic Messages API): token counts, model, tool calls
+   - Prometheus metrics (request counts, byte totals, connections)
 
 ## Quickstart
 

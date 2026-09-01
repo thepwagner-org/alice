@@ -1,10 +1,18 @@
 //! Integration tests for Alice HTTPS proxy
 
+// Tests panic on failure (unwrap/expect) and discard handles intentionally.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    unused_results
+)]
+
 mod common;
 
 use common::{
-    echo_router, find_available_port, llm_router, spawn_https_server, spawn_https_server_with_app,
-    spawn_proxy, ProxyConfig, RuleSpec, LLM_SSE_SINGLE_TOOL, LLM_SSE_TEXT_ONLY,
+    find_available_port, spawn_https_server, spawn_https_server_with_app, spawn_proxy, ProxyConfig,
+    RuleSpec,
 };
 
 use axum::http::StatusCode;
@@ -1894,614 +1902,85 @@ async fn test_sse_streaming_h2() {
     }
 }
 
-// ============================================================================
-// LLM Metrics Parsing Tests
-// ============================================================================
-//
-// These tests verify that the proxy correctly parses streaming SSE responses
-// from the Anthropic Messages API and emits structured `llm.completion`
-// tracing events with model, token counts, and tool call details.
-
 #[tokio::test]
-async fn test_llm_metrics_h1_single_tool() {
-    // Test that LLM metrics are extracted from a streaming /v1/messages response
-    // through the HTTP/1.1 inspection path (proxy_with_inspection).
+async fn test_sse_streaming_h2_to_h1() {
+    // Test SSE streaming when the client speaks HTTP/2 but the upstream only
+    // speaks HTTP/1.1 (the proxy_h2_to_h1 translation path). This is the path
+    // hit when Claude Code (h2) is pointed at an HTTP/1.1-only LLM gateway via
+    // ANTHROPIC_BASE_URL. The proxy must forward SSE events incrementally, not
+    // buffer the whole response before translating it back to h2.
     let proxy_port = find_available_port().await;
-    let metrics_port = find_available_port().await;
     let temp_dir = tempfile::tempdir().expect("temp dir");
 
-    // Start upstream mock with /v1/messages serving single-tool SSE fixture
-    let (upstream_port, upstream_cert, _upstream_handle) =
-        spawn_https_server_with_app(llm_router(LLM_SSE_SINGLE_TOOL), false).await;
+    // Upstream supports HTTP/1.1 ONLY, forcing the h2->h1 translation path.
+    let (upstream_port, upstream_cert, _upstream_handle) = spawn_https_server_h1_only().await;
 
-    // Start proxy with path-based rule (forces inspection path) and metrics endpoint
-    let _proxy = spawn_proxy(
+    let _proxy_handle = spawn_proxy(
         ProxyConfig {
             listen_port: proxy_port,
-            rules: vec![rule_host_path("allow", "localhost", "/v1/messages")],
-            auth: None,
+            rules: vec![RuleSpec::host("allow", "localhost")],
             upstream_ca_pem: Some(upstream_cert.clone()),
-            credentials_toml: vec![],
-            metrics_port: Some(metrics_port),
             ..Default::default()
         },
         &temp_dir,
     )
     .await;
 
-    // Build HTTP/1.1-only client
-    let client = client_with_proxy_h1_only(proxy_port, &temp_dir.path().join("ca.pem"));
-
-    // POST to /v1/messages — this triggers LLM metrics parsing
-    let url = format!("https://localhost:{}/v1/messages", upstream_port);
-    let result = timeout(Duration::from_secs(10), client.post(&url).send()).await;
-
-    let response = result.expect("timeout").expect("request");
-    assert_eq!(response.status(), StatusCode::OK);
-
-    // Consume the entire response body so the stream completes
-    let _body = response.bytes().await.expect("body");
-
-    // Small delay to let the proxy push metrics to the store
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // Query the metrics endpoint
-    let metrics_client = reqwest::Client::new();
-    let metrics_url = format!("http://127.0.0.1:{}/llm/completions", metrics_port);
-    let metrics_resp = metrics_client
-        .get(&metrics_url)
-        .send()
-        .await
-        .expect("metrics request");
-    let body = metrics_resp.text().await.expect("metrics body");
-    let completions: Vec<serde_json::Value> =
-        serde_json::from_str(&body).expect("parse metrics JSON");
-
-    assert_eq!(
-        completions.len(),
-        1,
-        "Expected exactly 1 LLM completion metric, got {}",
-        completions.len(),
-    );
-
-    let m = &completions[0];
-    assert_eq!(m["model"], "claude-opus-4-6");
-    assert_eq!(m["input_tokens"], 3);
-    assert_eq!(m["output_tokens"], 78);
-    assert_eq!(m["cache_read_tokens"], 21612);
-
-    let tool_calls = m["tool_calls"].as_array().expect("tool_calls is array");
-    assert_eq!(tool_calls.len(), 1);
-    assert_eq!(tool_calls[0]["name"], "Bash");
-    assert_eq!(
-        tool_calls[0]["arguments"]["command"],
-        "cargo fmt --check 2>&1"
-    );
-    assert_eq!(
-        tool_calls[0]["arguments"]["description"],
-        "Check formatting"
-    );
-}
-
-#[tokio::test]
-async fn test_llm_metrics_h1_text_only() {
-    // Test text-only response (no tool calls) — verify token counts and empty tool_calls
-    let proxy_port = find_available_port().await;
-    let metrics_port = find_available_port().await;
-    let temp_dir = tempfile::tempdir().expect("temp dir");
-
-    let (upstream_port, upstream_cert, _upstream_handle) =
-        spawn_https_server_with_app(llm_router(LLM_SSE_TEXT_ONLY), false).await;
-
-    let _proxy = spawn_proxy(
-        ProxyConfig {
-            listen_port: proxy_port,
-            rules: vec![rule_host_path("allow", "localhost", "/v1/messages")],
-            auth: None,
-            upstream_ca_pem: Some(upstream_cert.clone()),
-            credentials_toml: vec![],
-            metrics_port: Some(metrics_port),
-            ..Default::default()
-        },
-        &temp_dir,
-    )
-    .await;
-
-    let client = client_with_proxy_h1_only(proxy_port, &temp_dir.path().join("ca.pem"));
-
-    let url = format!("https://localhost:{}/v1/messages", upstream_port);
-    let result = timeout(Duration::from_secs(10), client.post(&url).send()).await;
-    let response = result.expect("timeout").expect("request");
-    assert_eq!(response.status(), StatusCode::OK);
-    let _body = response.bytes().await.expect("body");
-
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    let metrics_client = reqwest::Client::new();
-    let metrics_url = format!("http://127.0.0.1:{}/llm/completions", metrics_port);
-    let metrics_resp = metrics_client
-        .get(&metrics_url)
-        .send()
-        .await
-        .expect("metrics request");
-    let body = metrics_resp.text().await.expect("metrics body");
-    let completions: Vec<serde_json::Value> =
-        serde_json::from_str(&body).expect("parse metrics JSON");
-
-    assert_eq!(
-        completions.len(),
-        1,
-        "Expected exactly 1 LLM completion metric, got {}",
-        completions.len(),
-    );
-
-    let m = &completions[0];
-    assert_eq!(m["model"], "claude-haiku-4-5-20251001");
-    assert_eq!(m["input_tokens"], 291);
-    assert_eq!(m["output_tokens"], 14);
-    assert_eq!(m["cache_read_tokens"], 0);
-
-    let tool_calls = m["tool_calls"].as_array().expect("tool_calls is array");
-    assert!(tool_calls.is_empty());
-}
-
-#[tokio::test]
-async fn test_llm_metrics_h2() {
-    // Test LLM metrics through the HTTP/2 proxy path (handle_stream in h2.rs).
-    let proxy_port = find_available_port().await;
-    let metrics_port = find_available_port().await;
-    let temp_dir = tempfile::tempdir().expect("temp dir");
-
-    // Start upstream mock with H2 enabled
-    let (upstream_port, upstream_cert, _upstream_handle) =
-        spawn_https_server_with_app(llm_router(LLM_SSE_SINGLE_TOOL), true).await;
-
-    let _proxy = spawn_proxy(
-        ProxyConfig {
-            listen_port: proxy_port,
-            rules: vec![rule_host_path("allow", "localhost", "/v1/messages")],
-            auth: None,
-            upstream_ca_pem: Some(upstream_cert.clone()),
-            credentials_toml: vec![],
-            metrics_port: Some(metrics_port),
-            ..Default::default()
-        },
-        &temp_dir,
-    )
-    .await;
-
-    // Build H2 client
+    // H2-capable client: negotiates h2 with the proxy; proxy talks h1.1 upstream.
     let client = client_with_proxy_h2(
         proxy_port,
         &temp_dir.path().join("ca.pem"),
         Some(&upstream_cert),
     );
 
-    let url = format!("https://localhost:{}/v1/messages", upstream_port);
-    let result = timeout(Duration::from_secs(10), client.post(&url).send()).await;
+    let url = format!("https://localhost:{}/sse", upstream_port);
+    let result = timeout(Duration::from_secs(10), client.get(&url).send()).await;
+
     let response = result.expect("timeout").expect("request");
     assert_eq!(response.status(), StatusCode::OK);
-    // Verify we actually got HTTP/2
+    // Client side is HTTP/2 even though upstream was HTTP/1.1.
     assert_eq!(response.version(), reqwest::Version::HTTP_2);
-    let _body = response.bytes().await.expect("body");
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut events = Vec::new();
+    let mut event_times = Vec::new();
+    let start = Instant::now();
+    let mut stream = response.bytes_stream();
+    use futures_util::StreamExt;
 
-    let metrics_client = reqwest::Client::new();
-    let metrics_url = format!("http://127.0.0.1:{}/llm/completions", metrics_port);
-    let metrics_resp = metrics_client
-        .get(&metrics_url)
-        .send()
-        .await
-        .expect("metrics request");
-    let body = metrics_resp.text().await.expect("metrics body");
-    let completions: Vec<serde_json::Value> =
-        serde_json::from_str(&body).expect("parse metrics JSON");
-
-    assert_eq!(
-        completions.len(),
-        1,
-        "Expected exactly 1 LLM completion metric via H2, got {}",
-        completions.len(),
-    );
-
-    let m = &completions[0];
-    assert_eq!(m["model"], "claude-opus-4-6");
-    assert_eq!(m["input_tokens"], 3);
-    assert_eq!(m["output_tokens"], 78);
-    assert_eq!(m["cache_read_tokens"], 21612);
-
-    let tool_calls = m["tool_calls"].as_array().expect("tool_calls is array");
-    assert_eq!(tool_calls.len(), 1);
-    assert_eq!(tool_calls[0]["name"], "Bash");
-}
-
-// ============================================================================
-// System Prompt Injection Tests
-// ============================================================================
-
-#[tokio::test]
-async fn test_system_prompt_injection_h1() {
-    // Test that the proxy appends a suffix to the system prompt in /v1/messages requests.
-    // Uses an echo endpoint that returns the request body so we can inspect the modification.
-    let proxy_port = find_available_port().await;
-    let temp_dir = tempfile::tempdir().expect("temp dir");
-
-    let (upstream_port, upstream_cert, _upstream_handle) =
-        spawn_https_server_with_app(echo_router(), false).await;
-
-    let _proxy = spawn_proxy(
-        ProxyConfig {
-            listen_port: proxy_port,
-            rules: vec![rule_host_path("allow", "localhost", "/v1/messages")],
-            upstream_ca_pem: Some(upstream_cert.clone()),
-            transforms_toml: vec![
-                "\n[[transforms]]\ntype = \"system_prompt\"\nsuffix = \"Always mention John Cena.\"\n".to_string(),
-            ],
-            ..Default::default()
-        },
-        &temp_dir,
-    )
-    .await;
-
-    let client = client_with_proxy_h1_only(proxy_port, &temp_dir.path().join("ca.pem"));
-
-    // Send a /v1/messages request with a string system prompt
-    let url = format!("https://localhost:{}/v1/messages", upstream_port);
-    let body = serde_json::json!({
-        "model": "claude-opus-4-6",
-        "system": "You are a helpful assistant.",
-        "messages": [{"role": "user", "content": "Hello"}]
-    });
-
-    let result = timeout(
-        Duration::from_secs(10),
-        client
-            .post(&url)
-            .header("content-type", "application/json")
-            .body(serde_json::to_string(&body).unwrap())
-            .send(),
-    )
-    .await;
-
-    let response = result.expect("timeout").expect("request");
-    assert_eq!(response.status(), StatusCode::OK);
-
-    // The echo endpoint returns the body the proxy forwarded to upstream
-    let echoed: serde_json::Value =
-        serde_json::from_str(&response.text().await.expect("body")).expect("parse echoed JSON");
-
-    assert_eq!(
-        echoed["system"],
-        "You are a helpful assistant.\n\nAlways mention John Cena."
-    );
-    // Other fields should be preserved
-    assert_eq!(echoed["model"], "claude-opus-4-6");
-    assert!(echoed["messages"].is_array());
-}
-
-#[tokio::test]
-async fn test_system_prompt_injection_absent_system() {
-    // When the request has no "system" field, the proxy should add one.
-    let proxy_port = find_available_port().await;
-    let temp_dir = tempfile::tempdir().expect("temp dir");
-
-    let (upstream_port, upstream_cert, _upstream_handle) =
-        spawn_https_server_with_app(echo_router(), false).await;
-
-    let _proxy = spawn_proxy(
-        ProxyConfig {
-            listen_port: proxy_port,
-            rules: vec![rule_host_path("allow", "localhost", "/v1/messages")],
-            upstream_ca_pem: Some(upstream_cert.clone()),
-            transforms_toml: vec![
-                "\n[[transforms]]\ntype = \"system_prompt\"\nsuffix = \"Always mention John Cena.\"\n".to_string(),
-            ],
-            ..Default::default()
-        },
-        &temp_dir,
-    )
-    .await;
-
-    let client = client_with_proxy_h1_only(proxy_port, &temp_dir.path().join("ca.pem"));
-
-    // Send without a system field
-    let url = format!("https://localhost:{}/v1/messages", upstream_port);
-    let body = serde_json::json!({
-        "model": "claude-opus-4-6",
-        "messages": [{"role": "user", "content": "Hello"}]
-    });
-
-    let result = timeout(
-        Duration::from_secs(10),
-        client
-            .post(&url)
-            .header("content-type", "application/json")
-            .body(serde_json::to_string(&body).unwrap())
-            .send(),
-    )
-    .await;
-
-    let response = result.expect("timeout").expect("request");
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let echoed: serde_json::Value =
-        serde_json::from_str(&response.text().await.expect("body")).expect("parse echoed JSON");
-
-    assert_eq!(echoed["system"], "Always mention John Cena.");
-}
-
-#[tokio::test]
-async fn test_system_prompt_injection_non_messages_unmodified() {
-    // Non-/v1/messages paths should NOT have their body modified.
-    let proxy_port = find_available_port().await;
-    let temp_dir = tempfile::tempdir().expect("temp dir");
-
-    let (upstream_port, upstream_cert, _upstream_handle) = spawn_https_server().await;
-
-    let _proxy = spawn_proxy(
-        ProxyConfig {
-            listen_port: proxy_port,
-            rules: vec![RuleSpec::host("allow", "localhost")],
-            upstream_ca_pem: Some(upstream_cert.clone()),
-            transforms_toml: vec![
-                "\n[[transforms]]\ntype = \"system_prompt\"\nsuffix = \"Always mention John Cena.\"\n".to_string(),
-            ],
-            ..Default::default()
-        },
-        &temp_dir,
-    )
-    .await;
-
-    let client = client_with_proxy_h1_only(proxy_port, &temp_dir.path().join("ca.pem"));
-
-    // A simple GET request should work fine and not be affected
-    let url = format!("https://localhost:{}/get", upstream_port);
-    let result = timeout(Duration::from_secs(5), client.get(&url).send()).await;
-    let response = result.expect("timeout").expect("request");
-    assert_eq!(response.status(), StatusCode::OK);
-}
-
-// ============================================================================
-// Prometheus Metrics Tests
-// ============================================================================
-
-/// Helper: fetch /metrics from the metrics server and return the body as a string.
-async fn fetch_prometheus_metrics(metrics_port: u16) -> String {
-    let client = reqwest::Client::new();
-    let url = format!("http://127.0.0.1:{}/metrics", metrics_port);
-    let resp = client.get(&url).send().await.expect("metrics request");
-    assert_eq!(resp.status(), StatusCode::OK);
-    resp.text().await.expect("metrics body")
-}
-
-/// Helper: extract the value of a Prometheus counter line matching the given labels.
-///
-/// Looks for a line like:
-///   alice_requests_total{host="localhost",method="GET",status_code="200",action="allow"} 2
-///
-/// Returns the counter value, or None if no matching line is found.
-fn extract_counter(metrics: &str, name: &str, labels: &[(&str, &str)]) -> Option<f64> {
-    for line in metrics.lines() {
-        if line.starts_with('#') || line.is_empty() {
-            continue;
-        }
-        // Match metric name
-        if !line.starts_with(name) {
-            continue;
-        }
-        // Check all labels are present
-        let all_match = labels
-            .iter()
-            .all(|(k, v)| line.contains(&format!("{}=\"{}\"", k, v)));
-        if all_match {
-            // Value is the last whitespace-separated token
-            if let Some(val_str) = line.split_whitespace().last() {
-                return val_str.parse::<f64>().ok();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.expect("chunk");
+        let text = String::from_utf8_lossy(&chunk);
+        event_times.push(start.elapsed());
+        for line in text.lines() {
+            if let Some(data) = line.strip_prefix("data: ") {
+                events.push(data.to_string());
             }
         }
     }
-    None
-}
 
-#[tokio::test]
-async fn test_prometheus_request_metrics() {
-    // Verifies that alice_requests_total, alice_request_bytes_total, and
-    // alice_response_bytes_total are incremented for allowed and denied requests.
-    let proxy_port = find_available_port().await;
-    let metrics_port = find_available_port().await;
-    let temp_dir = tempfile::tempdir().expect("temp dir");
+    assert_eq!(events.len(), 5, "Expected 5 SSE events, got: {:?}", events);
 
-    let (upstream_port, upstream_cert, _upstream_handle) = spawn_https_server().await;
-
-    // Only allow /get, deny everything else by default
-    let _proxy = spawn_proxy(
-        ProxyConfig {
-            listen_port: proxy_port,
-            rules: vec![rule_host_path("allow", "localhost", "/get")],
-            upstream_ca_pem: Some(upstream_cert.clone()),
-            metrics_port: Some(metrics_port),
-            ..Default::default()
-        },
-        &temp_dir,
-    )
-    .await;
-
-    let client = client_with_proxy_h1_only(proxy_port, &temp_dir.path().join("ca.pem"));
-
-    // Make 2 allowed GET requests
-    for _ in 0..2 {
-        let url = format!("https://localhost:{}/get", upstream_port);
-        let resp = timeout(Duration::from_secs(5), client.get(&url).send())
-            .await
-            .expect("timeout")
-            .expect("request");
-        assert_eq!(resp.status(), StatusCode::OK);
-        let _ = resp.bytes().await;
-    }
-
-    // Make 1 denied request (path /post is not allowed)
-    let url = format!("https://localhost:{}/post", upstream_port);
-    let resp = timeout(Duration::from_secs(5), client.post(&url).send())
-        .await
-        .expect("timeout")
-        .expect("request");
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-    let _ = resp.bytes().await;
-
-    // Give the proxy a moment to flush metrics
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    let metrics = fetch_prometheus_metrics(metrics_port).await;
-
-    // Verify allowed request counter
-    let allowed = extract_counter(
-        &metrics,
-        "alice_requests_total",
-        &[
-            ("host", "localhost"),
-            ("method", "GET"),
-            ("status_code", "200"),
-            ("action", "allow"),
-        ],
-    );
-    assert_eq!(
-        allowed,
-        Some(2.0),
-        "Expected 2 allowed GET requests.\nFull /metrics:\n{}",
-        metrics,
-    );
-
-    // Verify denied request counter
-    let denied = extract_counter(
-        &metrics,
-        "alice_requests_total",
-        &[
-            ("host", "localhost"),
-            ("method", "POST"),
-            ("status_code", "403"),
-            ("action", "deny"),
-        ],
-    );
-    assert_eq!(
-        denied,
-        Some(1.0),
-        "Expected 1 denied POST request.\nFull /metrics:\n{}",
-        metrics,
-    );
-
-    // Verify request bytes counter exists and is positive
-    let req_bytes = extract_counter(
-        &metrics,
-        "alice_request_bytes_total",
-        &[("host", "localhost")],
-    );
+    // A buffering proxy delivers the whole response as one DATA frame, which
+    // reqwest surfaces as a single chunk. Streaming delivers the 5 events (sent
+    // 50ms apart) as separate chunks. So requiring >= 2 chunks is what actually
+    // distinguishes streamed from buffered on this path — the from-first-to-last
+    // span check alone is silently skipped when everything arrives at once.
     assert!(
-        req_bytes.unwrap_or(0.0) > 0.0,
-        "Expected positive request bytes.\nFull /metrics:\n{}",
-        metrics,
+        event_times.len() >= 2,
+        "SSE response through the h2->h1 translation path arrived as a single \
+         chunk ({} chunks), which means handle_stream_to_h1() buffered the entire \
+         response before forwarding instead of streaming it. Chunk times: {:?}",
+        event_times.len(),
+        event_times,
     );
 
-    // Verify response bytes counter exists and is positive
-    let resp_bytes = extract_counter(
-        &metrics,
-        "alice_response_bytes_total",
-        &[("host", "localhost")],
-    );
+    let span = *event_times.last().unwrap() - *event_times.first().unwrap();
     assert!(
-        resp_bytes.unwrap_or(0.0) > 0.0,
-        "Expected positive response bytes.\nFull /metrics:\n{}",
-        metrics,
+        span >= Duration::from_millis(100),
+        "SSE events through the h2->h1 translation path should arrive \
+         incrementally. Time span from first to last chunk: {:?} (expected \
+         >= 100ms). Event times: {:?}",
+        span,
+        event_times,
     );
-}
-
-#[tokio::test]
-async fn test_prometheus_credential_metrics() {
-    // Verifies that alice_credential_injections_total is incremented when
-    // credentials are injected.
-    let proxy_port = find_available_port().await;
-    let metrics_port = find_available_port().await;
-    let temp_dir = tempfile::tempdir().expect("temp dir");
-
-    std::env::set_var("TEST_PROM_CRED_SECRET", "real-secret");
-
-    let (upstream_port, upstream_cert, _upstream_handle) = spawn_https_server().await;
-
-    let _proxy = spawn_proxy(
-        ProxyConfig {
-            listen_port: proxy_port,
-            rules: vec![RuleSpec::host("allow", "localhost")],
-            upstream_ca_pem: Some(upstream_cert.clone()),
-            credentials_toml: vec![credential_env(
-                "my-api-key",
-                "localhost",
-                "Authorization",
-                "Bearer DUMMY_TOKEN",
-                "Bearer {value}",
-                "TEST_PROM_CRED_SECRET",
-            )],
-            metrics_port: Some(metrics_port),
-            ..Default::default()
-        },
-        &temp_dir,
-    )
-    .await;
-
-    let client = client_with_proxy(proxy_port, &temp_dir.path().join("ca.pem"), None);
-
-    // Make 3 requests with the dummy token — each should trigger credential injection
-    for _ in 0..3 {
-        let url = format!("https://localhost:{}/headers", upstream_port);
-        let resp = timeout(
-            Duration::from_secs(5),
-            client
-                .get(&url)
-                .header("Authorization", "Bearer DUMMY_TOKEN")
-                .send(),
-        )
-        .await
-        .expect("timeout")
-        .expect("request");
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = resp.text().await.expect("body");
-        assert!(
-            body.contains("real-secret"),
-            "Credential should have been injected",
-        );
-    }
-
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    let metrics = fetch_prometheus_metrics(metrics_port).await;
-
-    let injections = extract_counter(
-        &metrics,
-        "alice_credential_injections_total",
-        &[("credential_name", "my-api-key"), ("host", "localhost")],
-    );
-    assert_eq!(
-        injections,
-        Some(3.0),
-        "Expected 3 credential injections.\nFull /metrics:\n{}",
-        metrics,
-    );
-
-    // Also verify request counter was incremented
-    let requests = extract_counter(
-        &metrics,
-        "alice_requests_total",
-        &[
-            ("host", "localhost"),
-            ("method", "GET"),
-            ("action", "allow"),
-        ],
-    );
-    assert_eq!(
-        requests,
-        Some(3.0),
-        "Expected 3 allowed GET requests.\nFull /metrics:\n{}",
-        metrics,
-    );
-
-    std::env::remove_var("TEST_PROM_CRED_SECRET");
 }

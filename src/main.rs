@@ -8,6 +8,11 @@ mod credentials;
 mod proxy;
 mod telemetry;
 
+// Generated sanctum wire types. The schema and its tonic codegen live in
+// the sanctum-client crate; re-exported under the old name so
+// `credentials.rs` keeps referencing `crate::sanctum_proto`.
+pub use sanctum_client::proto as sanctum_proto;
+
 #[derive(Parser, Debug)]
 #[command(name = "alice", about = "A sanitizing HTTPS proxy")]
 struct Args {
@@ -37,6 +42,6 @@ async fn main() -> Result<()> {
     info!(listen = %config.proxy.listen, "starting alice proxy");
 
     // Run proxy with graceful shutdown.
-    // Pass parent trace context so the server span links to the nix-jail job trace.
+    // Pass parent trace context so the server span links to the supervising job's trace.
     proxy::run(config, tracing_guard.parent_context().cloned()).await
 }

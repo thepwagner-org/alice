@@ -9,6 +9,15 @@
 //!
 //! Total bandwidth budget: ~50 MB per run (kept low to avoid long cooldowns).
 
+// Tests print progress, panic on failure (unwrap/expect), and discard handles.
+#![allow(
+    clippy::print_stdout,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    unused_results
+)]
+
 mod common;
 
 use common::{

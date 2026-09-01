@@ -5,8 +5,29 @@ edition = "2021"
 description = "A sanitizing HTTPS proxy for controlled network access"
 license = "MIT"
 
+[[bin]]
+name = "alice"
+path = "src/main.rs"
+
 [lints.rust]
 unsafe_code = "forbid"
+unsafe_op_in_unsafe_fn = "forbid"
+non_ascii_idents = "forbid"
+missing_unsafe_on_extern = "forbid"
+unused_results = "warn"
+missing_debug_implementations = "warn"
+variant_size_differences = "warn"
+
+[lints.clippy]
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+print_stdout = "deny"
+print_stderr = "deny"
+exit = "deny"
 
 [dependencies]
 # Async runtime
@@ -26,10 +47,10 @@ rcgen = "0.13"
 webpki-roots = "1"
 
 # DNS
-hickory-resolver = "0.24"
+hickory-resolver = "0.26"
 
 # Config & CLI
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 toml = "0.8"
 serde = { version = "1", features = ["derive"] }
 
@@ -44,12 +65,14 @@ moka = { version = "0.12", features = ["future"] }
 # Logging/tracing
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+tracing-appender = "0.2"
 
 # OpenTelemetry
-opentelemetry = { version = "0.31", default-features = false, features = ["trace"] }
-opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic", "http-proto", "reqwest-client"] }
-tracing-opentelemetry = "0.32"
+opentelemetry = { version = "0.32", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic", "http-proto", "reqwest-client"] }
+opentelemetry-proto = { version = "0.32", features = ["gen-tonic", "trace", "metrics"] }
+tracing-opentelemetry = "0.33"
 
 # Error handling
 thiserror = "2"
@@ -72,8 +95,21 @@ flate2 = "1"
 time = "0.3"
 base64 = "0.22"
 secrecy = "0.10"
-chrono = "0.4"
+subtle = "2"  # Constant-time credential comparison (proxy Basic auth)
+chrono = { version = "0.4", features = ["serde"] }
 serde_json = "1"
+
+# Used by the sanctum gRPC client to talk to the credential broker.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "http2", "stream"] }
+
+# sanctum gRPC API (client in src/credentials.rs). The wire schema and its
+# tonic codegen live in the sanctum-client crate, so alice does not define
+# the proto itself.
+# `tower::service_fn` builds the UDS connector for tonic's `connect_with_connector`.
+sanctum-client = { path = "vendor/sanctum-client" }
+tonic = "0.14"
+prost = "0.14"
+tower = { version = "0.5", features = ["util"] }
 
 [features]
 default = []
@@ -82,10 +118,9 @@ default = []
 axum = "0.7"
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 pem = "3"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "stream"] }
 tempfile = "3"
 futures-util = "0.3"
-tokio-stream = "0.1"
+tokio-stream = { version = "0.1", features = ["net"] }
 tokio-test = "0.4"
 tower = { version = "0.5", features = ["util"] }
 

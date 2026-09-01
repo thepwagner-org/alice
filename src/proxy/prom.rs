@@ -3,6 +3,10 @@
 //! Exposes request counts, byte totals, credential injections, and connection
 //! gauges via a `ProxyMetrics` struct backed by a `prometheus::Registry`.
 
+// Metric construction and registration cannot fail with hard-coded names/labels;
+// encoding into a String buffer cannot fail. Failing fast at startup is correct.
+#![allow(clippy::expect_used)]
+
 use prometheus::{self, Encoder, IntCounterVec, IntGauge, Opts, Registry, TextEncoder};
 
 /// All Prometheus metrics for the proxy.
@@ -26,6 +30,14 @@ pub struct ProxyMetrics {
 
     /// Currently active proxy connections.
     pub connections_active: IntGauge,
+
+    /// Telemetry collector signals received, by signal type and result.
+    /// signal ∈ traces | metrics
+    /// result ∈ forwarded | denied | dropped | decode_error
+    pub collector_received_total: IntCounterVec,
+
+    /// Telemetry collector gRPC forward errors, by signal type.
+    pub collector_forward_errors_total: IntCounterVec,
 }
 
 impl ProxyMetrics {
@@ -87,6 +99,30 @@ impl ProxyMetrics {
             .register(Box::new(connections_active.clone()))
             .expect("metric can be registered");
 
+        let collector_received_total = IntCounterVec::new(
+            Opts::new(
+                "alice_collector_received_total",
+                "Telemetry signals received by the collector",
+            ),
+            &["signal", "result"],
+        )
+        .expect("metric can be created");
+        registry
+            .register(Box::new(collector_received_total.clone()))
+            .expect("metric can be registered");
+
+        let collector_forward_errors_total = IntCounterVec::new(
+            Opts::new(
+                "alice_collector_forward_errors_total",
+                "Telemetry collector gRPC forward errors",
+            ),
+            &["signal"],
+        )
+        .expect("metric can be created");
+        registry
+            .register(Box::new(collector_forward_errors_total.clone()))
+            .expect("metric can be registered");
+
         Self {
             registry,
             requests_total,
@@ -94,6 +130,8 @@ impl ProxyMetrics {
             response_bytes_total,
             credential_injections_total,
             connections_active,
+            collector_received_total,
+            collector_forward_errors_total,
         }
     }
 
